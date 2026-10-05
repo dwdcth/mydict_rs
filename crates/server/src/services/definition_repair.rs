@@ -291,7 +291,9 @@ static USS_ANCHOR_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// 删掉「指向缺失 mp3」的红色美音喇叭锚点，返回 (改动词条数, 删除喇叭数)。
-/// 文件存在性走 resolve_resource_file（大小写不敏感兜底）——路由能取到的就不删。
+/// 存在性走 /dict-res 完整口径（磁盘 res/ + .mdd 大小写不敏感兜底）——
+/// 路由能取到的文件就不删按钮。正则回调不能 async，所以分三步：
+/// 同步收集锚点 → 异步批量判存在 → 同步重建字符串。
 pub async fn remove_missing_uss_speakers(
     state: &AppState,
     dictionary_id: i32,
@@ -337,22 +339,51 @@ pub async fn remove_missing_uss_speakers(
         for row in &rows {
             let id: i64 = row.try_get("", "id").unwrap_or_default();
             let definition: String = row.try_get("", "definition").unwrap_or_default();
-            let mut removed = 0i64;
-            let cleaned = USS_ANCHOR_RE
-                .replace_all(&definition, |caps: &regex::Captures| {
-                    let url = caps.name("url").map(|m| m.as_str()).unwrap_or_default();
-                    let relative = url.rsplit("/res/").next().unwrap_or(url);
-                    if dict_parser::resources::resolve_resource_file(res_dir, relative).is_some() {
-                        // 文件还在，按钮保留
-                        return caps[0].to_string();
-                    }
-                    removed += 1;
-                    String::new()
-                })
-                .into_owned();
-            if removed > 0 {
+            // ① 同步收集：每个锚点 (相对路径, 原文, 区间)
+            let mut anchors: Vec<(String, String, std::ops::Range<usize>)> = Vec::new();
+            for caps in USS_ANCHOR_RE.captures_iter(&definition) {
+                let whole = caps.get(0).expect("group 0");
+                let url = caps.name("url").map(|m| m.as_str()).unwrap_or_default();
+                let relative = url.rsplit("/res/").next().unwrap_or(url).to_string();
+                anchors.push((relative, whole.as_str().to_string(), whole.range()));
+            }
+            if anchors.is_empty() {
+                continue;
+            }
+            // ② 异步批量判存在（去重）
+            let mut unique: Vec<String> = anchors
+                .iter()
+                .map(|(rel, _, _)| rel.clone())
+                .collect();
+            unique.sort();
+            unique.dedup();
+            let mut available: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            for rel in &unique {
+                let exists = if dict_parser::resources::resolve_resource_file(res_dir, rel).is_some() {
+                    true
+                } else {
+                    crate::services::mdd_resources::resource_exists(state, dictionary_id, rel).await
+                };
+                available.insert(rel.clone(), exists);
+            }
+            // ③ 同步重建：文件还在的恢复原文，缺失的删除
+            let mut removed_here: i64 = 0;
+            let mut cleaned = String::with_capacity(definition.len());
+            let mut last = 0usize;
+            for (rel, original, range) in &anchors {
+                cleaned.push_str(&definition[last..range.start]);
+                if *available.get(rel).unwrap_or(&false) {
+                    cleaned.push_str(original); // 文件还在，按钮保留
+                } else {
+                    removed_here += 1;
+                }
+                last = range.end;
+            }
+            cleaned.push_str(&definition[last..]);
+            if removed_here > 0 {
                 updates.push((id, cleaned));
-                anchors_removed += removed;
+                anchors_removed += removed_here;
             }
         }
         for (id, new_definition) in &updates {

@@ -159,7 +159,10 @@ pub async fn entry(
         for source in &sources {
             if let Some(name) = source.file_name().and_then(|n| n.to_str()) {
                 if name.to_lowercase().ends_with(".mdx") {
-                    extra_assets = dict_parser::resources::same_name_assets(&res_dir, dict_id, name);
+                    extra_assets = crate::services::mdd_resources::same_name_assets_with_mdd(
+                        &app, dict_id, &res_dir, name,
+                    )
+                    .await;
                 }
             }
         }

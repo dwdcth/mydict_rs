@@ -3991,6 +3991,7 @@ dependencies = [
  "html-escape",
  "jsonwebtoken",
  "lol_html",
+ "mdictlib",
  "migration",
  "mime",
  "moka",

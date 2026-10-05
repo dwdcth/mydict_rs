@@ -53,50 +53,86 @@ pub async fn dict_resource(
         .join(dictionary_id.to_string())
         .join("res");
 
-    // 文件解析放阻塞线程（大小写不敏感兜底可能要建目录索引，30k 项 scandir）
+    // 1) 磁盘 res/（兄弟文件/历史解包/转码产物）：大小写不敏感解析放阻塞线程
     let res_dir2 = res_dir.clone();
     let normalized2 = normalized.clone();
-    let target = tokio::task::spawn_blocking(move || {
+    let disk_target = tokio::task::spawn_blocking(move || {
         res::resolve_resource_file(&res_dir2, &normalized2)
     })
     .await
     .ok()
     .flatten();
 
-    let target = match target {
-        Some(target) => Some(target),
-        // .mp3 缺而 .spx 在 → 现场转码
-        None if normalized.to_lowercase().ends_with(".mp3") => {
-            let spx_path = {
-                let mut s = normalized.clone();
-                s.truncate(s.len() - 4);
-                s.push_str(".spx");
-                s
-            };
-            let source = res::resolve_resource_file(&res_dir, &spx_path);
-            match source {
-                Some(source) => crate::services::spx::transcode_to_mp3(&source).await,
-                None => None,
+    if let Some(target) = disk_target {
+        let media_type = res::resource_media_type(&target);
+        return match NamedFile::open(&target) {
+            Ok(file) => dict_res_headers(
+                file.disable_content_disposition()
+                    .set_content_type(parse_mime(media_type))
+                    .into_response(&req),
+            ),
+            Err(_) => HttpResponse::NotFound().finish(),
+        };
+    }
+
+    // 2) 直接从词典的 .mdd 按需读取（磁盘优化：不再导入期全量解包）
+    if let Some(bytes) = crate::services::mdd_resources::lookup_resource(
+        &app,
+        dictionary_id,
+        &normalized,
+    )
+    .await
+    {
+        let media_type = res::resource_media_type(std::path::Path::new(&normalized));
+        return dict_res_headers(
+            HttpResponse::Ok()
+                .content_type(parse_mime(media_type))
+                .body(bytes.to_vec()),
+        );
+    }
+
+    // 3) .mp3 缺而 .spx 在（res/ 或 .mdd）→ 现场转码
+    if normalized.to_lowercase().ends_with(".mp3") {
+        let spx_rel = format!("{}.spx", &normalized[..normalized.len() - 4]);
+        let source = match res::resolve_resource_file(&res_dir, &spx_rel) {
+            Some(path) => Some(path),
+            None => {
+                // 从 .mdd 读出 .spx 字节 → 落临时文件再转码
+                match crate::services::mdd_resources::lookup_resource(&app, dictionary_id, &spx_rel).await {
+                    Some(bytes) => {
+                        let res_dir = res_dir.clone();
+                        match tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {
+                            std::fs::create_dir_all(&res_dir)?;
+                            let tmp = res_dir.join(format!(".spx-src-{}", std::process::id()));
+                            std::fs::write(&tmp, bytes.as_slice())?;
+                            Ok(tmp)
+                        })
+                        .await
+                        {
+                            Ok(Ok(tmp)) => Some(tmp),
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some(source) = source {
+            if let Some(mp3) = crate::services::spx::transcode_to_mp3(&source).await {
+                let media_type = res::resource_media_type(&mp3);
+                return match NamedFile::open(&mp3) {
+                    Ok(file) => dict_res_headers(
+                        file.disable_content_disposition()
+                            .set_content_type(parse_mime(media_type))
+                            .into_response(&req),
+                    ),
+                    Err(_) => HttpResponse::NotFound().finish(),
+                };
             }
         }
-        None => None,
-    };
-
-    let Some(target) = target else {
-        return HttpResponse::NotFound().finish();
-    };
-    let media_type = res::resource_media_type(&target);
-    let named = NamedFile::open(&target);
-    match named {
-        Ok(file) => {
-            let resp = file
-                .disable_content_disposition()
-                .set_content_type(parse_mime(media_type))
-                .into_response(&req);
-            dict_res_headers(resp)
-        }
-        Err(_) => HttpResponse::NotFound().finish(),
     }
+
+    HttpResponse::NotFound().finish()
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {

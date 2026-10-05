@@ -134,6 +134,7 @@ pub async fn upload(
             admin_id: admin.id,
             import_method: "upload".to_string(),
             skip_resources: false,
+            extract_resources: false, // 磁盘优化：默认不解包，/dict-res 直接读 .mdd
         },
     ) {
         Ok(task_id) => task_id,
@@ -179,6 +180,9 @@ pub struct ImportFromDictsDirRequest {
     pub lang_to: Option<String>,
     #[serde(default)]
     pub skip_resources: bool,
+    /// 可选：把 .mdd 全量解包到 res/（默认 false——运行期直接读 .mdd，省磁盘）
+    #[serde(default)]
+    pub extract_resources: bool,
     pub files: Vec<String>,
 }
 
@@ -217,6 +221,7 @@ pub async fn import_from_dicts_dir(
             admin_id: admin.id,
             import_method: "dicts_dir".to_string(),
             skip_resources: body.skip_resources,
+            extract_resources: body.extract_resources,
         },
     )?;
     Ok(web::Json(json!({"task_id": task_id})))

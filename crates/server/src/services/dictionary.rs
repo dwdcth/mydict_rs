@@ -646,7 +646,11 @@ pub struct ImportParams {
     pub staged_paths: Vec<PathBuf>,
     pub admin_id: i32,
     pub import_method: String, // "upload" | "dicts_dir"
+    /// true = 连释义引用都不改写（保留 sound:// 等原文）
     pub skip_resources: bool,
+    /// true = 额外把 .mdd 全量解包到 res/（磁盘换时延的可选项；默认 false，
+    /// 运行期由 /dict-res 直接读 .mdd）
+    pub extract_resources: bool,
 }
 
 /// 校验参数后把解析入库丢进后台任务，立即返回任务 id 供前端轮询。
@@ -753,11 +757,11 @@ async fn import_dictionary(
     let dict_id = dictionary.id;
 
     let storage_root = Path::new(&state.cfg.dictionary_storage_path).join(dict_id.to_string());
-    // 不要资源时不建 res/ 目录
-    let resource_dir = if params.skip_resources {
-        None
-    } else {
+    // 磁盘优化：默认不解包 .mdd（/dict-res 直接读）；引用改写与解包独立控制
+    let resource_dir = if params.extract_resources && !params.skip_resources {
         Some(storage_root.join("res"))
+    } else {
+        None
     };
 
     let result = import_entries_into(
@@ -767,9 +771,10 @@ async fn import_dictionary(
         &params.format,
         &params.staged_paths,
         resource_dir,
-        true,  // overwrite resources
-        0,     // generation 0
-        false, // 单事务（导入失败整体撤销）
+        !params.skip_resources, // 是否改写释义里的资源引用
+        true,                   // overwrite resources
+        0,                      // generation 0
+        false,                  // 单事务（导入失败整体撤销）
     )
     .await;
 
@@ -888,6 +893,7 @@ async fn record_source_files(
 /// 解析 + 写库的核心：生产者（阻塞线程解析）→ channel → 消费者（批量 INSERT）。
 /// generation 写指定代；commit_each_batch=true 时每批一个短事务（重解析写下一代用），
 /// 否则整部词典一个事务（导入用，失败整体撤销）。
+#[allow(clippy::too_many_arguments)]
 async fn import_entries_into(
     state: &Arc<AppState>,
     task_id: i64,
@@ -895,6 +901,7 @@ async fn import_entries_into(
     format: &str,
     staged_paths: &[PathBuf],
     resource_dir: Option<PathBuf>,
+    rewrite_refs: bool,
     overwrite_resources: bool,
     generation: i32,
     commit_each_batch: bool,
@@ -903,10 +910,13 @@ async fn import_entries_into(
 
     let format = format.to_string();
     let files = staged_paths.to_vec();
-    let opts = match &resource_dir {
-        Some(dir) => ParseOpts::new(dict_id).with_resources(dir.clone(), overwrite_resources),
-        None => ParseOpts::new(dict_id),
-    };
+    let mut opts = ParseOpts::new(dict_id);
+    if rewrite_refs {
+        opts = opts.with_rewrite();
+    }
+    if let Some(dir) = &resource_dir {
+        opts = opts.with_resources(dir.clone(), overwrite_resources);
+    }
     let producer = tokio::task::spawn_blocking(move || -> dict_parser::Result<()> {
         let mut parser = parser_by_format(&format)?;
         parser.parse(&files, &opts, &mut |batch| {
@@ -1220,6 +1230,7 @@ async fn reparse_one(
         &dictionary.format,
         paths,
         resource_dir,
+        true,  // 引用始终改写（与默认导入一致）
         false, // 资源只补缺失
         next_generation,
         true,  // 每批提交
@@ -1625,6 +1636,7 @@ pub async fn delete_dictionary(
 
     state.query_cache.invalidate();
     state.random_bounds.invalidate_all();
+    state.mdd_resources.invalidate_dictionary(dictionary_id);
     schedule_vacuum(state);
     Ok(())
 }

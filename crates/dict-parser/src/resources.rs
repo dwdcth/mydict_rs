@@ -315,6 +315,10 @@ pub fn copy_sibling_resources(resource_dir: &Path, sources: &[PathBuf]) -> usize
 }
 
 /// percent-encode（URL 路径段），对齐 Python urllib.parse.quote 的默认安全集 "/"
+pub fn quote_path_pub(value: &str) -> String {
+    quote_path(value)
+}
+
 fn quote_path(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {

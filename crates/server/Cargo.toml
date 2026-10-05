@@ -20,6 +20,7 @@ path = "src/bin/cli.rs"
 
 [dependencies]
 dict-parser = { path = "../dict-parser" }
+mdictlib.workspace = true
 migration = { path = "../migration" }
 actix-web.workspace = true
 actix-files.workspace = true

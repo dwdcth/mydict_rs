@@ -60,6 +60,14 @@ impl ParseOpts {
         }
     }
 
+    /// 只改写释义里的资源引用（/dict-res 绝对路径），不解包 .mdd 到磁盘。
+    /// 运行期由 /dict-res 路由直接从 .mdd 按需读取资源。
+    pub fn with_rewrite(mut self) -> Self {
+        self.rewrite_refs = true;
+        self
+    }
+
+    /// 改写引用并解包 .mdd 到磁盘（磁盘换性能的可选项）
     pub fn with_resources(mut self, dir: PathBuf, overwrite: bool) -> Self {
         self.rewrite_refs = true;
         self.resource_dir = Some(dir);

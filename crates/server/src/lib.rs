@@ -17,6 +17,7 @@ use crate::core::bootstrap::BootstrapState;
 use crate::core::query_cache::QueryCache;
 use crate::core::rate_limiter::MinuteCounters;
 use crate::services::background_task::BackgroundTasks;
+use crate::services::mdd_resources::MddResources;
 use crate::services::random_entry::RandomBounds;
 
 /// 进程内全局状态（单 worker 下等价于 Python 的模块级全局变量集合）。
@@ -32,6 +33,8 @@ pub struct AppState {
     pub random_bounds: RandomBounds,
     /// 每分钟限流计数器（固定墙钟分钟窗，70s TTL）
     pub minute_counters: MinuteCounters,
+    /// .mdd 直接读取（句柄缓存 + 256MB 资源字节缓存）——磁盘优化的核心
+    pub mdd_resources: MddResources,
     /// 导入/重解析/修复/VACUUM 等大写库任务互斥（SQLite 单写者，排队而非失败）
     pub bulk_write: tokio::sync::Mutex<()>,
     /// 正在重新解析的词典 id（同词典并发重解析拒绝）
@@ -50,6 +53,7 @@ impl AppState {
             query_cache: QueryCache::new(),
             random_bounds: RandomBounds::new(),
             minute_counters: MinuteCounters::new(),
+            mdd_resources: MddResources::new(),
             bulk_write: tokio::sync::Mutex::new(()),
             reparsing: std::sync::Mutex::new(HashSet::new()),
             vacuum_pending: std::sync::atomic::AtomicBool::new(false),
