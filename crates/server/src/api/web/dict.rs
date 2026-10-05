@@ -176,7 +176,7 @@ pub async fn entry(
     });
 
     let entries = query::get_entries_for_document(
-        &app.db,
+        &app,
         dictionary_id,
         word,
         entry_ids.as_deref(),

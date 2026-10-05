@@ -26,6 +26,8 @@
 | file_path | "; " 拼接列 | dictionary_sources 子表 |
 | LZO | ctypes 垫片直调 liblzo2 | 纯 Rust（lzokay/lzo1x），运行镜像免装库 |
 | ORM | SQLAlchemy（SQLite only） | SeaORM（SQLite/PostgreSQL/MySQL） |
+| 词条存储 | 全量入库 | 双模式：lite（默认，只落词头+序号，释义运行期按需读源文件，磁盘 ~1x、导入秒级）/ full（释义落库）；`POST /api/admin/dictionaries/{id}/entry-mode` 后台互转，转换走并行解析（`IMPORT_WORKERS`，默认核数一半封顶 4） |
+| 上传导入 | 单格式单选 | 多文件/文件夹/zip 拖拽上传，自动解压、识别格式与词典分组（`analyze-upload` + `import-uploaded`） |
 
 ## 部署
 

@@ -139,7 +139,7 @@ pub async fn entry(
     // 老快照可能存着 @@@LINK= 标记本身：兜底解引用
     let definition = match dictionary_id {
         Some(dict_id) => {
-            query_service::resolve_link_definition(&app.db, Some(dict_id), definition.as_deref())
+            query_service::resolve_link_definition(&app, Some(dict_id), definition.as_deref())
                 .await?
                 .unwrap_or_default()
         }

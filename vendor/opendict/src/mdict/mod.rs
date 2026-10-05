@@ -109,6 +109,12 @@ impl MdictDictionary {
         Ok(Some((word, text)))
     }
 
+    /// MYDICT-PATCH 6: headword-only positional access (mydict lite import
+    /// mode) — reads the key index without touching any record block.
+    pub fn word_at(&self, i: usize) -> Option<&str> {
+        self.mdx.keywords.get(i).map(String::as_str)
+    }
+
     /// MYDICT-PATCH 1: keyword count (equals entry count).
     pub fn entry_count(&self) -> usize {
         self.mdx.keywords.len()

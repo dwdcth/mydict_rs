@@ -76,6 +76,14 @@ impl ParseOpts {
     }
 }
 
+/// 轻量挂载模式的词头条目：词头 + 源文件内定位
+/// （mdx 词条序号 / stardict idx 下标；stardict 别名行的 ordinal 指向目标条目）
+#[derive(Debug, Clone)]
+pub struct Headword {
+    pub word: String,
+    pub ordinal: i64,
+}
+
 /// 三种词典格式解析器的统一接口 —— 对齐 Python `DictionaryParser`。
 pub trait DictionaryParser: Send {
     /// 流式解析，批量回调交付（emit 每次最多 2000 条）。
@@ -93,13 +101,39 @@ pub trait DictionaryParser: Send {
 
     /// 跨**整部**词典均匀取至多 limit 个词头（先跨完整段收集、再统一下采样）。
     fn sample_headwords(&mut self, files: &[PathBuf], limit: usize) -> Result<Vec<String>>;
+
+    /// 并行全量解析（lite→full 后台转换等 CPU 密集场景用）。
+    /// workers 个线程各开独立句柄、迭代不相交的序号区间；emit 仍单线程顺序回调。
+    /// 默认实现退回串行 parse（ECDICT/StarDict 走这条）。
+    fn parse_parallel(
+        &mut self,
+        files: &[PathBuf],
+        opts: &ParseOpts,
+        workers: usize,
+        emit: &mut dyn FnMut(Vec<ParsedEntry>) -> Result<()>,
+    ) -> Result<()> {
+        let _ = workers;
+        self.parse(files, opts, emit)
+    }
+
+    /// 轻量模式：只枚举词头与源文件定位（不读释义块）。批量回调交付。
+    /// 默认不支持（ECDICT 是 CSV，没有随机访问的意义）。
+    fn parse_headwords(
+        &mut self,
+        _files: &[PathBuf],
+        _emit: &mut dyn FnMut(Vec<Headword>) -> Result<()>,
+    ) -> Result<()> {
+        Err(ParserError::Validation(
+            "该格式不支持轻量导入（ECDICT 请使用全量模式）".into(),
+        ))
+    }
 }
 
 /// 按格式创建解析器
 pub fn parser_by_format(format: &str) -> Result<Box<dyn DictionaryParser>> {
     match format {
         "mdict" => Ok(Box::new(mdict::MdictParser::new())),
-        "stardict" => Ok(Box::new(stardict::StarDictParser)),
+        "stardict" => Ok(Box::new(stardict::StarDictParser::new())),
         "ecdict" => Ok(Box::new(ecdict::EcdictParser)),
         other => Err(ParserError::Validation(format!(
             "未知的词典格式: {other}"

@@ -13,6 +13,26 @@ export interface DictionaryItem {
   status: DictionaryStatus
   import_method: DictionaryImportMethod
   imported_at: string
+  /** full：释义落库；lite：词头入库、释义运行期从源文件按需读取 */
+  entry_mode?: 'full' | 'lite'
+}
+
+/** analyze-upload 的返回：上传暂存区解压分组后的识别结果 */
+export interface UploadedAnalysis {
+  upload_id: string
+  groups: DictsDirGroup[]
+  skipped: string[]
+}
+
+export interface ImportUploadedPayload {
+  upload_id: string
+  name: string
+  format: DictionaryFormat
+  lang_from?: string
+  lang_to?: string
+  /** full：释义落库；lite（默认）：只落词头 */
+  mode?: 'full' | 'lite'
+  files: string[]
 }
 
 export interface DictsDirFile {

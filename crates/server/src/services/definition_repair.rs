@@ -30,12 +30,34 @@ fn prefixes(dictionary_id: i32) -> (String, String, String) {
 
 /// 修复某部词典里全部坏链接（SQL replace 三连），返回实际改动行数。
 /// 刻意不恢复 javascript: 与 //host、www.host（无法与真实资源路径区分）。
+/// lite 词典释义不落库（源文件是唯一真相），修复类任务全部 no-op
+async fn is_lite_dictionary(state: &AppState, dictionary_id: i32) -> Result<bool, AppError> {
+    use sea_orm::ConnectionTrait;
+    let row = state
+        .db
+        .query_one_raw(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            "SELECT entry_mode FROM dictionaries WHERE id = $1",
+            [dictionary_id.into()],
+        ))
+        .await?;
+    Ok(row
+        .as_ref()
+        .and_then(|r| r.try_get::<String>("", "entry_mode").ok())
+        .map(|m| m == "lite")
+        .unwrap_or(false))
+}
+
 pub async fn repair_legacy_links(
     state: &AppState,
     dictionary_id: i32,
     batch_size: i64,
     dry_run: bool,
 ) -> Result<i64, AppError> {
+    if is_lite_dictionary(state, dictionary_id).await? {
+        return Ok(0);
+    }
+
     let (entry_from, sound_from, file_from) = prefixes(dictionary_id);
     let res_prefix = format!("/dict-res/{dictionary_id}/res/");
     let backend = state.db.get_database_backend();
@@ -114,6 +136,10 @@ pub async fn expand_stored_styles(
     compact: bool,
     batch_size: i64,
 ) -> Result<i64, AppError> {
+    if is_lite_dictionary(state, dictionary_id).await? {
+        return Ok(0);
+    }
+
     let backend = state.db.get_database_backend();
     let row = state
         .db
@@ -300,6 +326,10 @@ pub async fn remove_missing_uss_speakers(
     res_dir: &Path,
     batch_size: i64,
 ) -> Result<(i64, i64), AppError> {
+    if is_lite_dictionary(state, dictionary_id).await? {
+        return Ok((0, 0));
+    }
+
     let backend = state.db.get_database_backend();
     let row = state
         .db

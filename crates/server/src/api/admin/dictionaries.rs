@@ -38,6 +38,7 @@ pub async fn upload(
     let mut format = String::new();
     let mut lang_from: Option<String> = None;
     let mut lang_to: Option<String> = None;
+    let mut mode = dict_service::DEFAULT_IMPORT_MODE.to_string();
     let mut saved: Vec<PathBuf> = Vec::new();
     let mut total_bytes: i64 = 0;
     let max_bytes = app.cfg.max_upload_size_mb * 1024 * 1024;
@@ -100,6 +101,7 @@ pub async fn upload(
                         "format" => format = value,
                         "lang_from" => lang_from = Some(value),
                         "lang_to" => lang_to = Some(value),
+                        "mode" => mode = value,
                         _ => {} // 未知字段忽略
                     }
                 }
@@ -135,6 +137,7 @@ pub async fn upload(
             import_method: "upload".to_string(),
             skip_resources: false,
             extract_resources: false, // 磁盘优化：默认不解包，/dict-res 直接读 .mdd
+            mode,
         },
     ) {
         Ok(task_id) => task_id,
@@ -143,6 +146,140 @@ pub async fn upload(
             return Err(err);
         }
     };
+    Ok(web::Json(json!({"task_id": task_id})))
+}
+
+// ── 浏览器上传（多文件/文件夹/压缩包 → 自动分组导入）──────────────
+
+/// POST /api/admin/dictionaries/analyze-upload（multipart）
+/// 先把文件（含文件夹相对路径）落到暂存区、解压 .zip、按现有扫描逻辑分组返回，
+/// 不导入。前端确认分组后带 upload_id 调 import-uploaded。
+pub async fn analyze_upload(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+    mut payload: Multipart,
+) -> Result<web::Json<Value>, AppError> {
+    let _admin = require_admin(&req, &app).await?;
+    let upload_id = Uuid::new_v4().simple().to_string();
+    let staging = dict_service::upload_staging_dir(&app.cfg, &upload_id);
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|e| AppError::internal("staging", e))?;
+    let _ = tokio::task::spawn_blocking({
+        let cfg = app.cfg.clone();
+        move || dict_service::prune_stale_staging(&cfg)
+    })
+    .await;
+
+    let mut total_bytes: i64 = 0;
+    let max_bytes = app.cfg.max_upload_size_mb * 1024 * 1024;
+    let result = async {
+        use futures::StreamExt;
+        while let Some(item) = payload.next().await {
+            let mut field = item.map_err(|e| AppError::validation(format!("上传数据无效：{e}")))?;
+            let Some(filename) = field
+                .content_disposition()
+                .and_then(|d| d.get_filename())
+                .map(|f| f.replace('\\', "/"))
+            else {
+                // 非文件字段全部跳过（分析接口不需要表单值）
+                while let Some(chunk) = field.next().await {
+                    chunk.map_err(|e| AppError::validation(format!("上传中断：{e}")))?;
+                }
+                continue;
+            };
+            let target = dict_service::safe_staging_path(&staging, &filename)?;
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| AppError::internal("staging", e))?;
+            }
+            let mut file = tokio::fs::File::create(&target)
+                .await
+                .map_err(|e| AppError::internal("staging", e))?;
+            use tokio::io::AsyncWriteExt;
+            while let Some(chunk) = field.next().await {
+                let chunk = chunk.map_err(|e| AppError::validation(format!("上传中断：{e}")))?;
+                total_bytes += chunk.len() as i64;
+                if total_bytes > max_bytes {
+                    return Err(AppError::validation(format!(
+                        "上传文件总大小超过 {}MB 上限",
+                        app.cfg.max_upload_size_mb
+                    )));
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| AppError::internal("staging", e))?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(err);
+    }
+
+    let analysis = dict_service::analyze_upload_staging(&app, &upload_id).await?;
+    Ok(web::Json(analysis))
+}
+
+#[derive(Deserialize)]
+pub struct ImportUploadedRequest {
+    pub upload_id: String,
+    pub name: String,
+    pub format: String,
+    pub lang_from: Option<String>,
+    pub lang_to: Option<String>,
+    /// full：释义落库；lite（默认）：只落词头，释义运行期物化
+    #[serde(default = "default_import_mode")]
+    pub mode: String,
+    pub files: Vec<String>,
+}
+
+/// POST /api/admin/dictionaries/import-uploaded
+/// 导入 analyze-upload 分组里的一部（文件从暂存区移入词典 source/ 归档）。
+pub async fn import_uploaded(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+    body: web::Json<ImportUploadedRequest>,
+) -> Result<web::Json<Value>, AppError> {
+    let admin = require_admin(&req, &app).await?;
+    let name_len = body.name.trim().chars().count();
+    if name_len < 1 || name_len > 255 {
+        return Err(AppError::validation("词典名称长度须为 1-255 个字符"));
+    }
+    for lang in [&body.lang_from, &body.lang_to].into_iter().flatten() {
+        if lang.trim().is_empty() || lang.trim().chars().count() > 8 {
+            return Err(AppError::validation("语言代码须为 1-8 个字符"));
+        }
+    }
+    let mut staged =
+        dict_service::resolve_uploaded_files(&app.cfg, &body.upload_id, &body.files)?;
+    dict_service::append_sibling_assets_pub(&mut staged);
+    let task_id = dict_service::start_dictionary_import(
+        &app,
+        dict_service::ImportParams {
+            name: body.name.trim().to_string(),
+            format: body.format.clone(),
+            lang_from: body
+                .lang_from
+                .clone()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            lang_to: body
+                .lang_to
+                .clone()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            staged_paths: staged,
+            admin_id: admin.id,
+            import_method: "upload".to_string(),
+            skip_resources: false,
+            extract_resources: false,
+            mode: body.mode.clone(),
+        },
+    )?;
     Ok(web::Json(json!({"task_id": task_id})))
 }
 
@@ -183,7 +320,14 @@ pub struct ImportFromDictsDirRequest {
     /// 可选：把 .mdd 全量解包到 res/（默认 false——运行期直接读 .mdd，省磁盘）
     #[serde(default)]
     pub extract_resources: bool,
+    /// full：释义落库；lite（默认）：只落词头，释义运行期物化
+    #[serde(default = "default_import_mode")]
+    pub mode: String,
     pub files: Vec<String>,
+}
+
+fn default_import_mode() -> String {
+    dict_service::DEFAULT_IMPORT_MODE.to_string()
 }
 
 pub async fn import_from_dicts_dir(
@@ -222,9 +366,36 @@ pub async fn import_from_dicts_dir(
             import_method: "dicts_dir".to_string(),
             skip_resources: body.skip_resources,
             extract_resources: body.extract_resources,
+            mode: body.mode.clone(),
         },
     )?;
     Ok(web::Json(json!({"task_id": task_id})))
+}
+
+// ── 词条模式切换（lite↔full）─────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct EntryModeRequest {
+    /// "full"：释义落库（FTS 等高级查询的前提）；"lite"：只落词头
+    pub mode: String,
+}
+
+/// POST /api/admin/dictionaries/{id}/entry-mode
+/// 后台按新模式重灌词条（走 bulk_write 队列，与其它导入任务串行）
+pub async fn switch_entry_mode(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+    path: web::Path<i32>,
+    body: web::Json<EntryModeRequest>,
+) -> Result<web::Json<Value>, AppError> {
+    let admin = require_admin(&req, &app).await?;
+    let (task_id, changed) =
+        dict_service::start_mode_switch(&app, path.into_inner(), &body.mode).await?;
+    if !changed {
+        return Ok(web::Json(json!({"task_id": null, "changed": false})));
+    }
+    let _ = admin;
+    Ok(web::Json(json!({"task_id": task_id, "changed": true})))
 }
 
 // ── 批量操作 ─────────────────────────────────────────────────────
@@ -396,7 +567,7 @@ pub async fn test_query(
 ) -> Result<web::Json<Vec<Value>>, AppError> {
     require_admin(&req, &app).await?;
     Ok(web::Json(
-        dict_service::test_query(&app.db, path.into_inner(), &query.word, 20).await?,
+        dict_service::test_query(&app, path.into_inner(), &query.word, 20).await?,
     ))
 }
 
@@ -544,6 +715,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/admin/dictionaries/reorder", web::put().to(reorder))
         .route("/admin/dictionaries/batch-status", web::put().to(batch_status))
         .route("/admin/dictionaries/reparse", web::post().to(reparse))
+        .route("/admin/dictionaries/{id}/entry-mode", web::post().to(switch_entry_mode))
+        .route("/admin/dictionaries/analyze-upload", web::post().to(analyze_upload))
+        .route("/admin/dictionaries/import-uploaded", web::post().to(import_uploaded))
         .route("/admin/dictionaries/rename", web::post().to(rename))
         .route(
             "/admin/dictionaries/repair-from-source",

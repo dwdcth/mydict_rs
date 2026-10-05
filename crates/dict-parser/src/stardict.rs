@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::entry::{
     is_informative, is_informative_headword, spread_downsample, ParsedEntry, SAMPLE_SCAN_FACTOR,
 };
-use crate::{ParseOpts, ParserError, Result};
+use crate::{Headword, ParseOpts, ParserError, Result};
 
 /// 采样最多读 .idx 的前 1MB
 const SAMPLE_IDX_BYTES: usize = 1024 * 1024;
@@ -23,7 +23,68 @@ const SAMPLE_IDX_FULL_BYTES: usize = 32 * 1024 * 1024;
 /// 从 .idx 中段取样时一次 seek 后读取的窗口大小（一条记录十几字节，4KB 足够）
 const IDX_SEEK_CHUNK: usize = 4096;
 
-pub struct StarDictParser;
+pub struct StarDictParser {
+    /// 打开有代价（idx/syn 物化），跨 parse/sample/definition_at 复用；
+    /// 按 (目录, 词典名) 匹配失效
+    opened: Option<OpenedStar>,
+}
+
+struct OpenedStar {
+    dir: PathBuf,
+    name: String,
+    dict: opendict::stardict::StarDictDictionary,
+}
+
+impl StarDictParser {
+    pub fn new() -> Self {
+        Self { opened: None }
+    }
+
+    fn dir_name_of(ifo_path: &PathBuf) -> Result<(PathBuf, String)> {
+        let dir = ifo_path
+            .parent()
+            .ok_or_else(|| ParserError::Validation(".ifo 路径没有父目录".into()))?
+            .to_path_buf();
+        let name = ifo_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| ParserError::Validation(".ifo 文件名无效".into()))?;
+        Ok((dir, name))
+    }
+
+    /// lite 物化：按 idx 下标读单条释义（mmap 直达，不触其它数据块）。
+    /// 别名行 ordinal 指向目标条目，读到的即目标释义——与全量导入语义一致。
+    pub fn definition_at(&mut self, file_paths: &[PathBuf], ordinal: i64) -> Result<String> {
+        let (ifo_path, _idx_path, _dict_path, _syn_path) = required_paths(file_paths)?;
+        let dict = self.ensure_opened(&ifo_path)?;
+        let Some((_, raw)) = dict.raw_entry_at(ordinal as usize)? else {
+            return Err(ParserError::Internal("词条序号越界".into()));
+        };
+        Ok(String::from_utf8_lossy(raw).into_owned())
+    }
+
+    /// 打开（或复用）词典；cache_to_disk=false：不往词典目录写解压缓存
+    fn ensure_opened(
+        &mut self,
+        ifo_path: &PathBuf,
+    ) -> Result<&opendict::stardict::StarDictDictionary> {
+        let (dir, name) = Self::dir_name_of(ifo_path)?;
+        let need_open = !matches!(&self.opened, Some(opened)
+            if opened.dir == dir && opened.name == name);
+        if need_open {
+            let dict = opendict::stardict::StarDictDictionary::open_with_cache(&dir, &name, false)
+                .map_err(|e| ParserError::Internal(format!("StarDict 打开失败: {e}")))?;
+            self.opened = Some(OpenedStar { dir, name, dict });
+        }
+        Ok(&self.opened.as_ref().expect("open checked").dict)
+    }
+}
+
+impl Default for StarDictParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn parse_ifo(ifo_path: &Path) -> Result<HashMap<String, String>> {
     let mut meta = HashMap::new();
@@ -211,17 +272,7 @@ impl super::DictionaryParser for StarDictParser {
         emit: &mut dyn FnMut(Vec<ParsedEntry>) -> Result<()>,
     ) -> Result<()> {
         let (ifo_path, _idx_path, _dict_path, _syn_path) = required_paths(file_paths)?;
-        // opendict 按词典名前缀找文件；.ifo 的主干就是名字
-        let dir = ifo_path
-            .parent()
-            .ok_or_else(|| ParserError::Validation(".ifo 路径没有父目录".into()))?;
-        let name = ifo_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .ok_or_else(|| ParserError::Validation(".ifo 文件名无效".into()))?;
-        // cache_to_disk=false：不往用户词典目录写解压缓存（Python 版无此副作用）
-        let dict = opendict::stardict::StarDictDictionary::open_with_cache(dir, &name, false)
-            .map_err(|e| ParserError::Internal(format!("StarDict 打开失败: {e}")))?;
+        let dict = self.ensure_opened(&ifo_path)?;
 
         let mut batch: Vec<ParsedEntry> = Vec::with_capacity(2000);
         for i in 0..dict.entry_count() {
@@ -361,6 +412,54 @@ impl super::DictionaryParser for StarDictParser {
             }
         }
         Ok(spread_downsample(words, limit))
+    }
+
+    fn parse_headwords(
+        &mut self,
+        file_paths: &[PathBuf],
+        emit: &mut dyn FnMut(Vec<Headword>) -> Result<()>,
+    ) -> Result<()> {
+        let (ifo_path, _idx_path, _dict_path, _syn_path) = required_paths(file_paths)?;
+        let dir = ifo_path
+            .parent()
+            .ok_or_else(|| ParserError::Validation(".ifo 路径没有父目录".into()))?;
+        let name = ifo_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| ParserError::Validation(".ifo 文件名无效".into()))?;
+        let dict = opendict::stardict::StarDictDictionary::open_with_cache(dir, &name, false)
+            .map_err(|e| ParserError::Internal(format!("StarDict 打开失败: {e}")))?;
+
+        // 纯 idx 枚举：word_at 不触 .dict 数据块
+        let mut batch: Vec<Headword> = Vec::with_capacity(2000);
+        for i in 0..dict.entry_count() {
+            batch.push(Headword {
+                word: dict.word_at(i).to_string(),
+                ordinal: i as i64,
+            });
+            if batch.len() >= 2000 {
+                let out = std::mem::take(&mut batch);
+                emit(out)?;
+            }
+        }
+        // .syn 别名行：ordinal 指向目标条目（释义按目标下标读，词头显示别名）
+        for i in 0..dict.synonym_count() {
+            let Some((alias, target_index, _)) = dict.synonym_at(i) else {
+                continue;
+            };
+            batch.push(Headword {
+                word: alias,
+                ordinal: target_index as i64,
+            });
+            if batch.len() >= 2000 {
+                let out = std::mem::take(&mut batch);
+                emit(out)?;
+            }
+        }
+        if !batch.is_empty() {
+            emit(batch)?;
+        }
+        Ok(())
     }
 }
 

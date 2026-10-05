@@ -251,6 +251,8 @@ pub struct EntryRow {
     pub phonetic: Option<String>,
     pub definition: String,
     pub extra: Option<String>,
+    /// lite 远程行：源文件内定位（NULL = 全量行，definition 已落库）
+    pub source_ordinal: Option<i64>,
 }
 
 /// 生成 count 个占位符（PG 用 $N 从 start 开始、SQLite 用 ?）——动态 IN 列表用
@@ -301,7 +303,7 @@ async fn query_entries(
     let dict_ph = ph.take_n(dictionary_ids.len());
     let word_ph = ph.take_n(words_lower.len());
     let sql = format!(
-        "SELECT e.id, e.dictionary_id, e.word, e.word_lower, e.phonetic, e.definition, e.extra \
+        "SELECT e.id, e.dictionary_id, e.word, e.word_lower, e.phonetic, e.definition, e.extra, e.source_ordinal \
          FROM dict_entries e JOIN dictionaries d \
            ON e.dictionary_id = d.id AND e.generation = d.active_generation \
          WHERE e.dictionary_id IN ({dict_ph}) AND e.word_lower IN ({word_ph})"
@@ -326,6 +328,7 @@ async fn query_entries(
             phonetic: row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
             definition: row.try_get("", "definition").unwrap_or_default(),
             extra: row.try_get::<Option<String>>("", "extra").ok().flatten(),
+            source_ordinal: row.try_get::<Option<i64>>("", "source_ordinal").ok().flatten(),
         })
         .collect())
 }
@@ -342,7 +345,7 @@ async fn prefix_fallback_entries(
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
-            "SELECT e.id, e.dictionary_id, e.word, e.word_lower, e.phonetic, e.definition, e.extra \
+            "SELECT e.id, e.dictionary_id, e.word, e.word_lower, e.phonetic, e.definition, e.extra, e.source_ordinal \
              FROM dict_entries e JOIN dictionaries d \
                ON e.dictionary_id = d.id AND e.generation = d.active_generation \
              WHERE e.dictionary_id = $1 AND e.word_lower >= $2 AND e.word_lower < $3 \
@@ -365,6 +368,7 @@ async fn prefix_fallback_entries(
             phonetic: row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
             definition: row.try_get("", "definition").unwrap_or_default(),
             extra: row.try_get::<Option<String>>("", "extra").ok().flatten(),
+            source_ordinal: row.try_get::<Option<i64>>("", "source_ordinal").ok().flatten(),
         })
         .collect())
 }
@@ -397,10 +401,24 @@ fn link_target_ci(definition: &str) -> Option<String> {
 
 /// 跟进词条重定向，返回真正承载释义的那条记录。
 /// 只在本词典内跳转；链式最多 MAX_LINK_DEPTH 层；目标缺失返回当前条（显示标记比空白好排查）。
-async fn resolve_link(db: &DatabaseConnection, entry: &EntryRow) -> Result<EntryRow, AppError> {
+/// lite 远程行（definition 为空 + source_ordinal 存在）先从源文件物化释义——
+/// 既为 @@@LINK 判定，也把最终承载行的 definition 填成完整内容（出口即物化）。
+async fn resolve_link(state: &AppState, entry: &EntryRow) -> Result<EntryRow, AppError> {
+    let db = &state.db;
     let mut current = entry.clone();
     let mut seen: HashSet<String> = HashSet::new();
     for _ in 0..MAX_LINK_DEPTH {
+        if current.definition.is_empty() {
+            if let Some(ordinal) = current.source_ordinal {
+                if let Some(def) = crate::services::mdx_resources::materialize_definition(
+                    state, current.dictionary_id, ordinal,
+                )
+                .await
+                {
+                    current.definition = (*def).clone();
+                }
+            }
+        }
         let Some(target) = link_target_ci(&current.definition) else {
             return Ok(current);
         };
@@ -423,18 +441,19 @@ async fn resolve_link(db: &DatabaseConnection, entry: &EntryRow) -> Result<Entry
 
 /// 公开版：生词本等落库路径复用同一套解引用口径
 pub async fn resolve_entry_link(
-    db: &DatabaseConnection,
+    state: &AppState,
     entry: &EntryRow,
 ) -> Result<EntryRow, AppError> {
-    resolve_link(db, entry).await
+    resolve_link(state, entry).await
 }
 
 /// 把可能是 @@@LINK= 的释义解引用成真正承载内容的释义（生词本老快照兜底）
 pub async fn resolve_link_definition(
-    db: &DatabaseConnection,
+    state: &AppState,
     dictionary_id: Option<i32>,
     definition: Option<&str>,
 ) -> Result<Option<String>, AppError> {
+    let db = &state.db;
     let Some(dictionary_id) = dictionary_id else {
         return Ok(definition.map(String::from));
     };
@@ -456,7 +475,22 @@ pub async fn resolve_link_definition(
             .into_iter()
             .next();
         match following {
-            Some(following) => current = following.definition,
+            Some(following) => {
+                // lite 远程目标行：先物化再判定
+                if following.definition.is_empty() {
+                    if let Some(ordinal) = following.source_ordinal {
+                        if let Some(def) = crate::services::mdx_resources::materialize_definition(
+                            state, following.dictionary_id, ordinal,
+                        )
+                        .await
+                        {
+                            current = (*def).clone();
+                            continue;
+                        }
+                    }
+                }
+                current = following.definition;
+            }
             None => return Ok(Some(current)),
         }
     }
@@ -554,7 +588,7 @@ pub async fn search_word(
     let mut seen_targets: HashSet<(i32, i32)> = HashSet::new();
     for e in &entries {
         // @@@LINK 跟进到目标取内容，词头仍显示用户查到的那个
-        let resolved = resolve_link(&state.db, e).await?;
+        let resolved = resolve_link(state, e).await?;
         // 同词典几个变体跳到同一目标只留一条
         let target = (e.dictionary_id, resolved.id);
         if seen_targets.contains(&target) {
@@ -599,17 +633,17 @@ pub async fn get_raw_entry(
 
 /// 取某部词典里的一条词条（词条渲染用），@@@LINK 已解引用
 pub async fn get_entry(
-    db: &DatabaseConnection,
+    state: &AppState,
     dictionary_id: i32,
     word: &str,
 ) -> Result<Option<EntryRow>, AppError> {
     let word_lower = word.trim().to_lowercase();
-    let entry = query_entries(db, &[word_lower], &[dictionary_id])
+    let entry = query_entries(&state.db, &[word_lower], &[dictionary_id])
         .await?
         .into_iter()
         .next();
     match entry {
-        Some(entry) => Ok(Some(resolve_link(db, &entry).await?)),
+        Some(entry) => Ok(Some(resolve_link(state, &entry).await?)),
         None => Ok(None),
     }
 }
@@ -618,11 +652,12 @@ pub async fn get_entry(
 /// entry_ids 是客户端输入，只认 search 可能返回的那些（变体集 ∪ 前缀兜底 id）；
 /// 归属校验放应用侧——`dictionary_id=? AND id IN(…)` 会让规划器放弃主键。
 pub async fn get_entries_for_document(
-    db: &DatabaseConnection,
+    state: &AppState,
     dictionary_id: i32,
     word: &str,
     entry_ids: Option<&[i32]>,
 ) -> Result<Vec<EntryRow>, AppError> {
+    let db = &state.db;
     let word_lower = word.trim().to_lowercase();
     if word_lower.is_empty() {
         return Ok(Vec::new());
@@ -657,7 +692,7 @@ pub async fn get_entries_for_document(
         let mut ph = Ph::new(backend);
         let id_ph = ph.take_n(ids.len());
         let sql = format!(
-            "SELECT e.id, e.dictionary_id, e.word, e.word_lower, e.phonetic, e.definition, e.extra \
+            "SELECT e.id, e.dictionary_id, e.word, e.word_lower, e.phonetic, e.definition, e.extra, e.source_ordinal \
              FROM dict_entries e JOIN dictionaries d \
                ON e.dictionary_id = d.id AND e.generation = d.active_generation \
              WHERE e.id IN ({id_ph}) ORDER BY e.id"
@@ -676,6 +711,7 @@ pub async fn get_entries_for_document(
                 phonetic: row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
                 definition: row.try_get("", "definition").unwrap_or_default(),
                 extra: row.try_get::<Option<String>>("", "extra").ok().flatten(),
+                source_ordinal: row.try_get::<Option<i64>>("", "source_ordinal").ok().flatten(),
             })
             .collect();
         entries = candidates.into_iter().filter(|e| authorized(e)).collect();
@@ -692,7 +728,7 @@ pub async fn get_entries_for_document(
     let mut resolved: Vec<(i32, EntryRow)> = Vec::new();
     let mut seen: HashSet<i32> = HashSet::new();
     for entry in &entries {
-        let target = resolve_link(db, entry).await?;
+        let target = resolve_link(state, entry).await?;
         if seen.insert(target.id) {
             resolved.push((target.id, target));
         }

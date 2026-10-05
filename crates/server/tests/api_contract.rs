@@ -2,7 +2,7 @@
 //! 锁定：认证流、查询语义（@@@LINK/前缀兜底/语言路由）、生词本、Token 配额、错误包络。
 
 use actix_web::test as actix_test;
-use actix_web::{web, App};
+use actix_web::App;
 use serde_json::Value;
 use server::AppState;
 
@@ -14,7 +14,6 @@ struct TestApp {
 
 async fn spawn_app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("test.sqlite3");
     // 先跑迁移
     let settings = test_settings(&dir);
     let db = server::core::db::connect(&settings).await.expect("connect");
@@ -616,4 +615,592 @@ async fn chinese_variants_matched_by_simplified_input() {
     let results = resp["results"].as_array().unwrap();
     assert_eq!(results.len(), 1, "简体输入必须命中繁体词头");
     assert_eq!(results[0]["word"], "頭髮");
+}
+
+// ── lite 模式：导入→查询→词条文档 全链路（真实解析管线）────────
+
+/// 把语料拷进待导入目录后走 HTTP 导入，轮询任务直到完成，返回词典 id
+async fn import_corpus_via_api(
+    svc: &mut impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    >,
+    admin: &str,
+    inbox: &std::path::Path,
+    corpus_dir: &str,
+    filename: &str,
+    name: &str,
+    mode: &str,
+) -> Value {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata")
+        .join(corpus_dir);
+    let dst_dir = inbox.join(corpus_dir);
+    std::fs::create_dir_all(&dst_dir).expect("mkdir corpus");
+    std::fs::copy(src.join(filename), dst_dir.join(filename)).expect("copy corpus");
+
+    let mut body = serde_json::json!({
+        "name": name,
+        "format": if corpus_dir.starts_with("stardict") { "stardict" } else { "mdict" },
+        "files": [format!("{corpus_dir}/{filename}")],
+    });
+    if !mode.is_empty() {
+        body["mode"] = serde_json::json!(mode);
+    }
+    let req = TestRequest::post()
+        .uri("/api/admin/dictionaries/import-from-dicts-dir")
+        .pipe_bearer(admin)
+        .set_json(body)
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(svc, req).await;
+    let task_id = resp["task_id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("导入请求失败：{resp}"));
+
+    // 轮询任务状态（导入在后台 bulk_write 串行队列里跑）
+    for _ in 0..200 {
+        let req = TestRequest::get()
+            .uri(&format!("/api/admin/tasks/{task_id}"))
+            .pipe_bearer(admin)
+            .to_request();
+        let task: Value = actix_test::call_and_read_body_json(svc, req).await;
+        match task["status"].as_str().unwrap_or("") {
+            "success" => {
+                // 导入完默认 disabled（对齐 Python），测试里直接启用
+                let dict_id = task["result"]["dictionary_id"].as_i64().unwrap_or(0);
+                let req = TestRequest::put()
+                    .uri(&format!("/api/admin/dictionaries/{dict_id}/enable"))
+                    .pipe_bearer(admin)
+                    .to_request();
+                let resp = actix_test::call_service(svc, req).await;
+                assert!(resp.status().is_success(), "启用词典失败");
+                return task["result"].clone();
+            }
+            "failed" | "error" => panic!("导入任务失败：{task}"),
+            other => {
+                eprintln!("task {task_id} status={other} elapsed={}", task["elapsed_seconds"]);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("导入任务超时未完成");
+}
+
+#[actix_web::test]
+async fn lite_import_full_query_equivalence() {
+    let app = spawn_app().await;
+    let mut svc = init_service(&app.state).await;
+    let admin = admin_setup(&mut svc).await;
+    let admin = admin.as_str();
+    // 开放匿名查询
+    let req = TestRequest::put()
+        .uri("/api/admin/settings")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"open_access": true}))
+        .to_request();
+    assert!(actix_test::call_service(&mut svc, req).await.status().is_success());
+
+    // 同一部语料分别以 lite / full 导入（mode 省略 = 默认 lite）
+    let lite = import_corpus_via_api(
+        &mut svc, admin, &app.dir.path().join("dicts"), "mdx_v2_rich", "rich.mdx", "精简模式词典", "lite",
+    )
+    .await;
+    let full = import_corpus_via_api(
+        &mut svc, admin, &app.dir.path().join("dicts"), "mdx_v2_rich", "rich.mdx", "全量模式词典", "full",
+    )
+    .await;
+    let lite_id = lite["dictionary_id"].as_i64().expect("lite id") as i32;
+    let full_id = full["dictionary_id"].as_i64().expect("full id") as i32;
+
+    // 词头数一致（同源同量）
+    assert_eq!(lite["word_count"], full["word_count"]);
+
+    // lite：库里只有词头（definition 全空、source_ordinal 全非空）
+    {
+        use sea_orm::ConnectionTrait;
+        let row = app
+            .state
+            .db
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                app.state.db.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM dict_entries \
+                 WHERE dictionary_id = $1 AND source_ordinal IS NOT NULL AND definition = ''",
+                [lite_id.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("count row");
+        let n: i64 = row.try_get("", "n").unwrap();
+        assert_eq!(n, full["word_count"].as_i64().unwrap(), "lite 行应全部是远程行");
+    }
+
+    // 查询等价：appel（两跳 @@@LINK）两条结果内容一致
+    let query = |dict_id: i32| {
+        let uri = format!("/api/v1/query?word=appel&dict={dict_id}");
+        TestRequest::get().uri(&uri).to_request()
+    };
+    let lite_resp: Value = actix_test::call_and_read_body_json(&mut svc, query(lite_id)).await;
+    let full_resp: Value = actix_test::call_and_read_body_json(&mut svc, query(full_id)).await;
+    let lite_items = lite_resp["results"].as_array().expect("lite results");
+    let full_items = full_resp["results"].as_array().expect("full results");
+    assert_eq!(lite_items.len(), 1);
+    assert_eq!(lite_items[0]["word"], "appel");
+    assert_eq!(lite_items[0]["word"], full_items[0]["word"]);
+    assert_eq!(lite_items[0]["definition"], full_items[0]["definition"]);
+    assert!(
+        !lite_items[0]["definition"].as_str().unwrap().is_empty(),
+        "lite 释义应已物化：{lite_items:?}"
+    );
+
+    // 精确词 apple 释义等价（含样式展开与资源改写管线）
+    let query = |dict_id: i32| {
+        let uri = format!("/api/v1/query?word=apple&dict={dict_id}");
+        TestRequest::get().uri(&uri).to_request()
+    };
+    let lite_apple: Value = actix_test::call_and_read_body_json(&mut svc, query(lite_id)).await;
+    let full_apple: Value = actix_test::call_and_read_body_json(&mut svc, query(full_id)).await;
+    assert_eq!(
+        lite_apple["results"][0]["definition"],
+        full_apple["results"][0]["definition"],
+        "apple 释义应逐字节等价（样式展开+资源改写同管线）"
+    );
+
+    // 管理端测试查询也能看到物化释义
+    let req = TestRequest::get()
+        .uri(&format!(
+            "/api/admin/dictionaries/{lite_id}/test-query?word=apple"
+        ))
+        .pipe_bearer(admin)
+        .to_request();
+    let tq: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let items = tq.as_array().expect("test-query items");
+    assert!(items.iter().any(|it| {
+        it["word"].as_str().unwrap_or("") == "apple"
+            && !it["definition"].as_str().unwrap_or("").is_empty()
+    }));
+
+    // 建议词在 lite 上同样工作（纯词头索引）
+    let req = TestRequest::get()
+        .uri("/api/v1/suggest?prefix=app&limit=10")
+        .to_request();
+    let sug: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let words: Vec<&str> = sug["words"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(words.contains(&"apple"), "{words:?}");
+
+    // 词条文档（沙箱渲染）含物化释义
+    let req = TestRequest::get()
+        .uri(&format!("/api/dict/entry/{lite_id}?word=apple"))
+        .to_request();
+    let resp = actix_test::call_service(&mut svc, req).await;
+    assert!(resp.status().is_success(), "lite 词条文档应可渲染");
+    let body = actix_test::read_body(resp).await;
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("apple") || html.contains("苹果"), "文档应含释义内容");
+}
+
+#[actix_web::test]
+async fn lite_is_default_import_mode_and_stardict_works() {
+    let app = spawn_app().await;
+    let mut svc = init_service(&app.state).await;
+    let admin = admin_setup(&mut svc).await;
+    let admin = admin.as_str();
+    let req = TestRequest::put()
+        .uri("/api/admin/settings")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"open_access": true}))
+        .to_request();
+    assert!(actix_test::call_service(&mut svc, req).await.status().is_success());
+
+    // mode 省略 → 默认 lite
+    let result = import_corpus_via_api(
+        &mut svc, admin, &app.dir.path().join("dicts"), "mdx_v2_rich", "rich.mdx", "默认模式词典", "",
+    )
+    .await;
+    let dict_id = result["dictionary_id"].as_i64().unwrap() as i32;
+    {
+        use sea_orm::ConnectionTrait;
+        let row = app
+            .state
+            .db
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                app.state.db.get_database_backend(),
+                "SELECT entry_mode FROM dictionaries WHERE id = $1",
+                [dict_id.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("dict row");
+        assert_eq!(row.try_get::<String>("", "entry_mode").unwrap(), "lite");
+    }
+
+    // StarDict lite：别名行指向目标、物化后可查
+    for f in ["test.ifo", "test.idx", "test.dict", "test.syn"] {
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("testdata/stardict_basic")
+                .join(f),
+            {
+                let dir = app.dir.path().join("dicts/stardict_basic");
+                std::fs::create_dir_all(&dir).unwrap();
+                dir.join(f)
+            },
+        )
+        .expect("copy stardict");
+    }
+    let req = TestRequest::post()
+        .uri("/api/admin/dictionaries/import-from-dicts-dir")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({
+            "name": "星際辭典",
+            "format": "stardict",
+            "files": ["stardict_basic/test.ifo","stardict_basic/test.idx","stardict_basic/test.dict","stardict_basic/test.syn"],
+        }))
+        .to_request();
+    let resp = actix_test::call_service(&mut svc, req).await;
+    let status = resp.status();
+    let body = actix_test::read_body(resp).await;
+    let resp: Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("stardict 导入响应非 JSON：{status} {e} body={}", String::from_utf8_lossy(&body)));
+    let task_id = resp["task_id"].as_i64().unwrap();
+    let mut sd_id = 0i32;
+    for _ in 0..200 {
+        let req = TestRequest::get()
+            .uri(&format!("/api/admin/tasks/{task_id}"))
+            .pipe_bearer(admin)
+            .to_request();
+        let task: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+        if task["status"] == "success" {
+            sd_id = task["result"]["dictionary_id"].as_i64().unwrap() as i32;
+            let req = TestRequest::put()
+                .uri(&format!("/api/admin/dictionaries/{sd_id}/enable"))
+                .pipe_bearer(admin)
+                .to_request();
+            assert!(actix_test::call_service(&mut svc, req).await.status().is_success());
+            break;
+        }
+        assert_ne!(task["status"], "failed", "stardict lite 导入失败：{task}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_ne!(sd_id, 0);
+
+    // 别名 apple fruit → 目标 apple 释义（远程物化）
+    let req = TestRequest::get()
+        .uri(&format!("/api/v1/query?word=apple%20fruit&d={sd_id}"))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let items = resp["results"].as_array().expect("alias results");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["word"], "apple fruit");
+    let def = items[0]["definition"].as_str().unwrap_or_default();
+    assert!(def.contains("苹果"), "别名行应物化目标释义：{def}");
+
+    // ECDICT lite → 422（先把语料拷进待导入目录）
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("testdata/ecdict_mini.csv"),
+        app.dir.path().join("dicts/ecdict_mini.csv"),
+    )
+    .unwrap();
+    let req = TestRequest::post()
+        .uri("/api/admin/dictionaries/import-from-dicts-dir")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({
+            "name": "csv",
+            "format": "ecdict",
+            "mode": "lite",
+            "files": ["ecdict_mini.csv"],
+        }))
+        .to_request();
+    let resp = actix_test::call_service(&mut svc, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        422,
+        "ECDICT + lite 应被模式校验拒绝"
+    );
+}
+
+
+#[actix_web::test]
+async fn mode_switch_converts_lite_full_roundtrip() {
+    let app = spawn_app().await;
+    let mut svc = init_service(&app.state).await;
+    let admin = admin_setup(&mut svc).await;
+    let admin = admin.as_str();
+    let req = TestRequest::put()
+        .uri("/api/admin/settings")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"open_access": true}))
+        .to_request();
+    assert!(actix_test::call_service(&mut svc, req).await.status().is_success());
+
+    // lite 导入并启用
+    let result = import_corpus_via_api(
+        &mut svc, admin, &app.dir.path().join("dicts"), "mdx_v2_rich", "rich.mdx", "待转换词典", "lite",
+    )
+    .await;
+    let dict_id = result["dictionary_id"].as_i64().unwrap() as i32;
+
+    // lite → full：后台重灌（走真实并行解析管线）
+    let req = TestRequest::post()
+        .uri(&format!("/api/admin/dictionaries/{dict_id}/entry-mode"))
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"mode": "full"}))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(resp["changed"], true);
+    let task_id = resp["task_id"].as_i64().unwrap();
+    for _ in 0..200 {
+        let req = TestRequest::get()
+            .uri(&format!("/api/admin/tasks/{task_id}"))
+            .pipe_bearer(admin)
+            .to_request();
+        let task: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+        match task["status"].as_str().unwrap_or("") {
+            "success" => break,
+            "failed" | "error" => panic!("转换失败：{task}"),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+
+    use sea_orm::ConnectionTrait;
+    let backend = app.state.db.get_database_backend();
+    // full 后：释义全部落库、source_ordinal 全空、entry_mode=full
+    let row = app.state.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+        backend,
+        "SELECT COUNT(*) AS n FROM dict_entries \
+         WHERE dictionary_id = $1 AND source_ordinal IS NULL AND definition != ''",
+        [dict_id.into()],
+    )).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        result["word_count"].as_i64().unwrap(),
+        "转换后应为全量行"
+    );
+    let row = app.state.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+        backend,
+        "SELECT entry_mode FROM dictionaries WHERE id = $1",
+        [dict_id.into()],
+    )).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<String>("", "entry_mode").unwrap(), "full");
+
+    // 查询依旧等价（apple 走落库释义）
+    let req = TestRequest::get()
+        .uri(&format!("/api/v1/query?word=appel&dict={dict_id}"))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let items = resp["results"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["word"], "appel");
+    assert!(items[0]["definition"].as_str().unwrap().contains("苹果"));
+
+    // 同模式再切 → no-op
+    let req = TestRequest::post()
+        .uri(&format!("/api/admin/dictionaries/{dict_id}/entry-mode"))
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"mode": "full"}))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(resp["changed"], false);
+
+    // full → lite：切回轻量
+    let req = TestRequest::post()
+        .uri(&format!("/api/admin/dictionaries/{dict_id}/entry-mode"))
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"mode": "lite"}))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let task_id = resp["task_id"].as_i64().expect("切回 lite 任务");
+    for _ in 0..200 {
+        let req = TestRequest::get()
+            .uri(&format!("/api/admin/tasks/{task_id}"))
+            .pipe_bearer(admin)
+            .to_request();
+        let task: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+        match task["status"].as_str().unwrap_or("") {
+            "success" => break,
+            "failed" | "error" => panic!("切回失败：{task}"),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    let row = app.state.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+        backend,
+        "SELECT COUNT(*) AS n FROM dict_entries \
+         WHERE dictionary_id = $1 AND source_ordinal IS NOT NULL AND definition = ''",
+        [dict_id.into()],
+    )).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        result["word_count"].as_i64().unwrap(),
+        "切回后应为远程行"
+    );
+    // 查询继续工作（物化）
+    let req = TestRequest::get()
+        .uri(&format!("/api/v1/query?word=appel&dict={dict_id}"))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert!(resp["results"][0]["definition"].as_str().unwrap().contains("苹果"));
+
+    // ECDICT 词典不支持 lite（构造一部 ecdict 全量词典再切）
+    let ec_id = seed_dictionary(&app.state, "csv典", "en", "zh-Hans", &[("hello", "你好")]).await;
+    let req = TestRequest::post()
+        .uri(&format!("/api/admin/dictionaries/{ec_id}/entry-mode"))
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({"mode": "lite"}))
+        .to_request();
+    let resp = actix_test::call_service(&mut svc, req).await;
+    assert_eq!(resp.status().as_u16(), 422, "ECDICT 不应允许切 lite");
+}
+
+// ── 浏览器上传：压缩包 → 自动解压分组 → 导入 ─────────────────────
+
+fn multipart_file_body(filename: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+    let boundary = "----mydicttestboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        body,
+    )
+}
+
+#[actix_web::test]
+async fn upload_zip_analyze_and_import() {
+    let app = spawn_app().await;
+    let mut svc = init_service(&app.state).await;
+    let admin = admin_setup(&mut svc).await;
+    let admin = admin.as_str();
+
+    // 打一个 zip：一部 mdict 词典 + 一个无关 txt
+    let mdx_bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("testdata/mdx_v2_rich/rich.mdx"),
+    )
+    .expect("corpus mdx");
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(&mut zip_buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file("牛津/oxford.mdx", opts).unwrap();
+        zip.write_all(&mdx_bytes).unwrap();
+        zip.start_file("readme.txt", opts).unwrap();
+        zip.write_all(b"not a dictionary").unwrap();
+        zip.finish().unwrap();
+    }
+    let (content_type, body) = multipart_file_body("词典打包.zip", zip_buf.get_ref());
+
+    // ① analyze-upload：解压 + 分组
+    let req = TestRequest::post()
+        .uri("/api/admin/dictionaries/analyze-upload")
+        .pipe_bearer(admin)
+        .insert_header((actix_web::http::header::CONTENT_TYPE, content_type))
+        .set_payload(body)
+        .to_request();
+    let analysis: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let groups = analysis["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(groups[0]["format"], "mdict");
+    assert_eq!(groups[0]["name"], "oxford");
+    assert_eq!(groups[0]["importable"], true);
+    let files: Vec<String> = groups[0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["relpath"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(files, vec!["牛津/oxford.mdx".to_string()]);
+    assert!(
+        analysis["skipped"].as_array().unwrap().iter().any(|s| s.as_str().unwrap_or("").ends_with("readme.txt")),
+        "无关文件应进 skipped：{analysis}"
+    );
+    let upload_id = analysis["upload_id"].as_str().unwrap().to_string();
+
+    // ② import-uploaded：导入该组（默认 lite）
+    let req = TestRequest::post()
+        .uri("/api/admin/dictionaries/import-uploaded")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({
+            "upload_id": upload_id,
+            "name": "牛津高阶",
+            "format": "mdict",
+            "files": files,
+        }))
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let task_id = resp["task_id"].as_i64().unwrap();
+    let mut dict_id = 0i32;
+    for _ in 0..200 {
+        let req = TestRequest::get()
+            .uri(&format!("/api/admin/tasks/{task_id}"))
+            .pipe_bearer(admin)
+            .to_request();
+        let task: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+        match task["status"].as_str().unwrap_or("") {
+            "success" => {
+                dict_id = task["result"]["dictionary_id"].as_i64().unwrap() as i32;
+                break;
+            }
+            "failed" | "error" => panic!("导入失败：{task}"),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    assert_ne!(dict_id, 0);
+
+    // 上传导入：文件应已从暂存区移入 source/ 归档
+    let source_dir = app.dir.path().join(format!("dictionaries/{dict_id}/source"));
+    let archived: Vec<String> = std::fs::read_dir(&source_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(archived, vec!["oxford.mdx".to_string()], "{archived:?}");
+
+    // 默认 lite：测试查询能看到物化释义
+    let req = TestRequest::put()
+        .uri(&format!("/api/admin/dictionaries/{dict_id}/enable"))
+        .pipe_bearer(admin)
+        .to_request();
+    assert!(actix_test::call_service(&mut svc, req).await.status().is_success());
+    let req = TestRequest::get()
+        .uri(&format!("/api/admin/dictionaries/{dict_id}/test-query?word=appel"))
+        .pipe_bearer(admin)
+        .to_request();
+    let tq: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert!(
+        tq.as_array().unwrap().iter().any(|it| it["word"] == "appel"
+            && !it["definition"].as_str().unwrap_or("").is_empty()),
+        "{tq:?}"
+    );
+
+    // 路径穿越防护：import-uploaded 带相对路径逃逸 → 422
+    let req = TestRequest::post()
+        .uri("/api/admin/dictionaries/import-uploaded")
+        .pipe_bearer(admin)
+        .set_json(serde_json::json!({
+            "upload_id": upload_id,
+            "name": "evil",
+            "format": "mdict",
+            "files": ["../../../etc/passwd"],
+        }))
+        .to_request();
+    let resp = actix_test::call_service(&mut svc, req).await;
+    assert_eq!(resp.status().as_u16(), 422);
 }

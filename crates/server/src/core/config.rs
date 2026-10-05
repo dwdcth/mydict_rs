@@ -15,6 +15,9 @@ pub struct Settings {
     pub anonymous_ip_rate_limit_per_min: i64,
     pub user_ip_rate_limit_per_min: i64,
     pub max_upload_size_mb: i64,
+    /// 全量解析（导入/lite→full 转换）的并行 worker 数。
+    /// 0 = 自动：核数一半、封顶 4（CPU 留余量，导入任务又经 bulk_write 串行排队）
+    pub import_workers: usize,
     pub enable_scheduler: bool,
     /// 「一天」的划分时区；留空或无效时回落系统时区
     pub timezone: String,
@@ -45,13 +48,28 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// 0 = 自动：核数一半、封顶 4（CPU 留余量，多词典导入也不叠满核）
+fn effective_import_workers(configured: usize) -> usize {
+    if configured > 0 {
+        return configured.min(16);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    (cores / 2).clamp(1, 4)
+}
+
 fn env_i64(key: &str, default: i64) -> i64 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 impl Settings {
     pub fn from_env() -> Self {
-        Self {
+        let mut settings = Self {
             jwt_secret: env_str("JWT_SECRET", ""),
             open_access_default: env_bool("OPEN_ACCESS_DEFAULT", false),
             allow_registration_default: env_bool("ALLOW_REGISTRATION_DEFAULT", true),
@@ -59,6 +77,7 @@ impl Settings {
             anonymous_ip_rate_limit_per_min: env_i64("ANONYMOUS_IP_RATE_LIMIT_PER_MIN", 60),
             user_ip_rate_limit_per_min: env_i64("USER_IP_RATE_LIMIT_PER_MIN", 120),
             max_upload_size_mb: env_i64("MAX_UPLOAD_SIZE_MB", 512),
+            import_workers: env_usize("IMPORT_WORKERS", 0),
             enable_scheduler: env_bool("ENABLE_SCHEDULER", true),
             timezone: env_str("TIMEZONE", ""),
             version_file_path: env_str("VERSION_FILE_PATH", "/version.txt"),
@@ -70,7 +89,9 @@ impl Settings {
             log_dir: env_str("LOG_DIR", "/data/logs"),
             static_dir: env_str("STATIC_DIR", "static"),
             online_dict_proxy: env_str("ONLINE_DICT_PROXY", ""),
-        }
+        };
+        settings.import_workers = effective_import_workers(settings.import_workers);
+        settings
     }
 
     /// 实际使用的数据库 URL：DATABASE_URL 优先，否则 sqlite:///{database_path}

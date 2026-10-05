@@ -16,6 +16,10 @@ pub struct Model {
     pub status: String,
     pub imported_at: i64,
     pub imported_by: Option<i32>,
+    /// full：释义落库；lite：只落词头，释义运行期从源文件按需读取
+    pub entry_mode: String,
+    /// lite 物化时是否跳过资源引用改写（对齐导入期 skip_resources 语义）
+    pub skip_resource_rewrite: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

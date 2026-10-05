@@ -13,6 +13,7 @@ pub mod settings_service;
 pub mod system_status;
 pub mod entry_render;
 pub mod mdd_resources;
+pub mod mdx_resources;
 pub mod query_log;
 pub mod rate_limit;
 pub mod web_rate_limit;

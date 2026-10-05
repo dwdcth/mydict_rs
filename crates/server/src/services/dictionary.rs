@@ -93,6 +93,7 @@ pub fn dict_to_json(d: &crate::entities::dictionary::Model) -> Value {
         "status": d.status,
         "import_method": d.import_method,
         "imported_at": crate::core::timeutil::unix_to_iso(d.imported_at),
+        "entry_mode": d.entry_mode,
     })
 }
 
@@ -442,6 +443,237 @@ fn iter_scan_dirs(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     result
 }
 
+// ── 浏览器上传（多文件/文件夹/压缩包 → 自动分组）──────────────────
+
+/// 上传暂存目录：dictionary_storage_path/_staging/{upload_id}
+pub fn upload_staging_dir(settings: &crate::core::config::Settings, upload_id: &str) -> PathBuf {
+    Path::new(&settings.dictionary_storage_path)
+        .join("_staging")
+        .join(upload_id)
+}
+
+/// 暂存区里的相对文件名（浏览器文件夹上传会带子目录）逐段校验后拼出目标路径。
+/// 拒绝空段 / "." / ".." / 绝对路径 / 反斜杠 / 深度超限。
+pub fn safe_staging_path(root: &Path, rel: &str) -> Result<PathBuf, AppError> {
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == ".." || p.contains('\\')) {
+        return Err(AppError::validation(format!("非法文件名：{rel}")));
+    }
+    if parts.len() > MAX_SCAN_DEPTH {
+        return Err(AppError::validation(format!("目录层级过深：{rel}")));
+    }
+    Ok(root.join(parts.join("/")))
+}
+
+/// 就地解压暂存区里的压缩包（.zip，含一层嵌套 zip），总解压量按上传上限封顶。
+/// 解压成功后删除压缩包本体（内容已在暂存区，留着会被当垃圾文件重复分组）。
+fn extract_archives(root: &Path, max_bytes: i64) -> Result<usize, AppError> {
+    let mut extracted_total = 0usize;
+    for _pass in 0..2 {
+        let mut zips: Vec<PathBuf> = Vec::new();
+        collect_zips(root, 0, &mut zips);
+        if zips.is_empty() {
+            break;
+        }
+        for zip_path in zips {
+            let count = extract_one_zip(&zip_path, max_bytes)?;
+            extracted_total += count;
+            let _ = std::fs::remove_file(&zip_path);
+        }
+    }
+    Ok(extracted_total)
+}
+
+fn collect_zips(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_zips(&path, depth + 1, out);
+        } else if path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn extract_one_zip(zip_path: &Path, max_bytes: i64) -> Result<usize, AppError> {
+    let out_dir = zip_path.parent().unwrap_or(zip_path);
+    let file = std::fs::File::open(zip_path)
+        .map_err(|_| AppError::validation(format!("压缩包无法读取：{}", zip_path.display())))?;
+    let file_size = std::fs::metadata(zip_path).map(|m| m.len() as i64).unwrap_or(0);
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AppError::validation(format!("压缩包无效（{}）：{e}", zip_path.display())))?;
+    let mut written = 0i64;
+    let mut count = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AppError::validation(format!("压缩包条目读取失败：{e}")))?;
+        // enclosed_name 已剔除 ../ 与绝对路径；None 的条目直接跳过
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        let dest = out_dir.join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&dest)
+                .map_err(|e| AppError::internal("unzip", e))?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::internal("unzip", e))?;
+        }
+        let mut out = std::fs::File::create(&dest)
+            .map_err(|e| AppError::internal("unzip", e))?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| AppError::internal("unzip", e))?;
+        written += std::fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+        count += 1;
+        if file_size + written > max_bytes {
+            let _ = std::fs::remove_file(&dest);
+            return Err(AppError::validation(format!(
+                "压缩包解压后超过 {}MB 上限",
+                max_bytes / 1024 / 1024
+            )));
+        }
+    }
+    Ok(count)
+}
+
+/// 分析一个已落盘的上传暂存目录：解压 → 收集文件 → 按现有扫描逻辑分组。
+/// 返回 {upload_id, groups, skipped}（groups 结构与 dicts_dir 扫描一致）。
+pub async fn analyze_upload_staging(
+    state: &AppState,
+    upload_id: &str,
+) -> Result<Value, AppError> {
+    let root = upload_staging_dir(&state.cfg, upload_id);
+    if !root.is_dir() {
+        return Err(AppError::not_found("上传内容不存在或已过期"));
+    }
+    let max_bytes = state.cfg.max_upload_size_mb * 1024 * 1024;
+    let root2 = root.clone();
+    tokio::task::spawn_blocking(move || extract_archives(&root2, max_bytes))
+        .await
+        .map_err(|e| AppError::internal("spawn", e))??;
+
+    // 深度受限收集全部文件（文件夹上传保留了子目录结构）
+    let root3 = root.clone();
+    let files = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+        fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+            if depth > MAX_SCAN_DEPTH {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, depth + 1, out);
+                } else if path.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root3, 0, &mut files);
+        files
+    })
+    .await
+    .map_err(|e| AppError::internal("spawn", e))?;
+
+    // 暂存区里的文件都没导入过：imported 集合为空
+    let imported = std::collections::HashSet::new();
+    let mut skipped = Vec::new();
+    let groups = build_dict_groups(&files, &root, &imported, &mut skipped);
+    Ok(json!({
+        "upload_id": upload_id,
+        "groups": groups,
+        "skipped": skipped,
+    }))
+}
+
+/// import-uploaded：把前端回传的相对文件名解析回暂存区内的真实路径（防穿越）
+pub fn resolve_uploaded_files(
+    settings: &crate::core::config::Settings,
+    upload_id: &str,
+    files: &[String],
+) -> Result<Vec<PathBuf>, AppError> {
+    let root = upload_staging_dir(settings, upload_id);
+    let root_canon = root
+        .canonicalize()
+        .map_err(|_| AppError::not_found("上传内容不存在或已过期"))?;
+    let mut resolved = Vec::with_capacity(files.len());
+    for file in files {
+        let path = safe_staging_path(&root, file)?;
+        let canon = path
+            .canonicalize()
+            .map_err(|_| AppError::validation(format!("文件不存在：{file}")))?;
+        if !canon.starts_with(&root_canon) || !canon.is_file() {
+            return Err(AppError::validation(format!("文件不在上传内容里：{file}")));
+        }
+        resolved.push(canon);
+    }
+    if resolved.is_empty() {
+        return Err(AppError::validation("files 不能为空"));
+    }
+    Ok(resolved)
+}
+
+/// 把分组文件同目录、同主干的附属 .css/.js 一并带上：
+/// 上传暂存区 24h 后会被清理，不随导入归档就永久丢了
+/// （dicts_dir 流程源目录保留原文件，无需此举）。
+pub fn append_sibling_assets_pub(staged: &mut Vec<PathBuf>) {
+    append_sibling_assets(staged);
+}
+
+fn append_sibling_assets(staged: &mut Vec<PathBuf>) {
+    let mut extra: Vec<PathBuf> = Vec::new();
+    for path in staged.iter() {
+        let Some(dir) = path.parent() else { continue };
+        let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        for ext in [".css", ".js"] {
+            let candidate = dir.join(format!("{stem}{ext}"));
+            if candidate.is_file() && !staged.contains(&candidate) && !extra.contains(&candidate) {
+                extra.push(candidate);
+            }
+        }
+    }
+    staged.extend(extra);
+}
+
+/// 清理 24h 前的上传暂存目录（analyze 时顺带做；导入成功会把文件移走，剩下的残壳很小）
+pub fn prune_stale_staging(settings: &crate::core::config::Settings) {
+    let staging = Path::new(&settings.dictionary_storage_path).join("_staging");
+    let Ok(entries) = std::fs::read_dir(&staging) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t < cutoff)
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// dicts_dir 列表（含分组）。返回 (normalized_path, entries, dictionaries, skipped)
 pub async fn list_dicts_dir_files(
     state: &AppState,
@@ -638,6 +870,10 @@ mod tests {
 
 // ── 导入管线 ─────────────────────────────────────────────────────
 
+/// 导入模式的默认值（lite：词头入库 + 释义挂载，磁盘 ~1x、导入秒级；
+/// 要 FTS 等高级查询时再切 full）
+pub const DEFAULT_IMPORT_MODE: &str = "lite";
+
 pub struct ImportParams {
     pub name: String,
     pub format: String,
@@ -651,6 +887,9 @@ pub struct ImportParams {
     /// true = 额外把 .mdd 全量解包到 res/（磁盘换时延的可选项；默认 false，
     /// 运行期由 /dict-res 直接读 .mdd）
     pub extract_resources: bool,
+    /// "lite"（默认）：只落词头+序号，释义运行期从源文件物化；
+    /// "full"：释义落库（FTS 等高级查询的前提）
+    pub mode: String,
 }
 
 /// 校验参数后把解析入库丢进后台任务，立即返回任务 id 供前端轮询。
@@ -661,6 +900,12 @@ pub fn start_dictionary_import(
 ) -> Result<i64, AppError> {
     validate_format(&params.format)?;
     validate_file_extensions(&params.format, &params.staged_paths)?;
+    if !matches!(params.mode.as_str(), "full" | "lite") {
+        return Err(AppError::validation("mode 须为 full 或 lite"));
+    }
+    if params.mode == "lite" && params.format == "ecdict" {
+        return Err(AppError::validation("ECDICT 不支持 lite 模式（CSV 无随机访问价值），请用 full"));
+    }
     let task_id = state.tasks.start("dictionary_import", &params.name, false);
     let state = state.clone();
     tokio::spawn(async move {
@@ -749,6 +994,8 @@ async fn import_dictionary(
         status: Set("disabled".to_string()),
         imported_by: Set(Some(params.admin_id)),
         imported_at: Set(now),
+        entry_mode: Set(params.mode.clone()),
+        skip_resource_rewrite: Set(params.skip_resources),
         ..Default::default()
     };
     let dictionary = crate::entities::dictionary::Entity::insert(record)
@@ -764,19 +1011,43 @@ async fn import_dictionary(
         None
     };
 
-    let result = import_entries_into(
-        state,
-        task_id,
-        dict_id,
-        &params.format,
-        &params.staged_paths,
-        resource_dir,
-        !params.skip_resources, // 是否改写释义里的资源引用
-        true,                   // overwrite resources
-        0,                      // generation 0
-        false,                  // 单事务（导入失败整体撤销）
-    )
-    .await;
+    let lite = params.mode == "lite";
+    let result = if lite {
+        // lite：只落词头。兄弟 css/js 附件仍复制（词条渲染样式注入要用），
+        // .mdd 资源由 /dict-res 运行期直读
+        let res_dir = storage_root.join("res");
+        let files = params.staged_paths.clone();
+        let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            std::fs::create_dir_all(&res_dir)?;
+            dict_parser::resources::copy_sibling_resources(&res_dir, &files);
+            Ok(())
+        })
+        .await;
+        import_headwords_into(
+            state,
+            task_id,
+            dict_id,
+            &params.format,
+            &params.staged_paths,
+            0,    // generation 0
+            false // 单事务（导入失败整体撤销）
+        )
+        .await
+    } else {
+        import_entries_into(
+            state,
+            task_id,
+            dict_id,
+            &params.format,
+            &params.staged_paths,
+            resource_dir,
+            !params.skip_resources, // 是否改写释义里的资源引用
+            true,                   // overwrite resources
+            0,                      // generation 0
+            false,                  // 单事务（导入失败整体撤销）
+        )
+        .await
+    };
 
     let word_count = match result {
         Ok(count) => count,
@@ -847,6 +1118,7 @@ async fn import_dictionary(
             "lang_from": lang_from,
             "lang_to": lang_to,
             "skip_resources": params.skip_resources,
+            "mode": params.mode,
         })),
     )
     .await?;
@@ -917,9 +1189,11 @@ async fn import_entries_into(
     if let Some(dir) = &resource_dir {
         opts = opts.with_resources(dir.clone(), overwrite_resources);
     }
+    // mdict 走并行解析（worker 数受 IMPORT_WORKERS/核数约束；其余格式退回串行）
+    let workers = state.cfg.import_workers;
     let producer = tokio::task::spawn_blocking(move || -> dict_parser::Result<()> {
         let mut parser = parser_by_format(&format)?;
-        parser.parse(&files, &opts, &mut |batch| {
+        parser.parse_parallel(&files, &opts, workers, &mut |batch| {
             tx.blocking_send(batch)
                 .map_err(|_| dict_parser::ParserError::Internal("导入消费端已退出".into()))
         })
@@ -990,6 +1264,136 @@ async fn import_entries_into(
     progress.insert("done".into(), json!(count));
     state.tasks.update_progress(task_id, progress);
     Ok(count)
+}
+
+/// lite 导入核心：生产者（阻塞线程枚举词头）→ channel → 消费者（批量 INSERT）。
+/// 只读 key 索引、不解压任何 record 块——大词典导入从分钟级降到秒级，
+/// 磁盘上也不落释义（词头行 ~50B/条 vs 全量数 KB/条）。
+async fn import_headwords_into(
+    state: &Arc<AppState>,
+    task_id: i64,
+    dict_id: i32,
+    format: &str,
+    staged_paths: &[PathBuf],
+    generation: i32,
+    commit_each_batch: bool,
+) -> Result<i64, AppError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<dict_parser::Headword>>(4);
+    let format = format.to_string();
+    let files = staged_paths.to_vec();
+    let producer = tokio::task::spawn_blocking(move || -> dict_parser::Result<()> {
+        let mut parser = parser_by_format(&format)?;
+        parser.parse_headwords(&files, &mut |batch| {
+            tx.blocking_send(batch)
+                .map_err(|_| dict_parser::ParserError::Internal("导入消费端已退出".into()))
+        })
+    });
+
+    let mut count: i64 = 0;
+    let mut error: Option<AppError> = None;
+    let mut tx = if commit_each_batch {
+        None
+    } else {
+        Some(state.db.begin().await.map_err(AppError::from)?)
+    };
+    while let Some(batch) = rx.recv().await {
+        let outcome = match &tx {
+            Some(t) => match insert_headword_batch(t, dict_id, &batch, generation).await {
+                Ok(()) => None,
+                Err(e) => Some(e),
+            },
+            None => match insert_headword_batch(&state.db, dict_id, &batch, generation).await {
+                Ok(()) => None,
+                Err(e) => Some(e),
+            },
+        };
+        match outcome {
+            None => {
+                count += batch.len() as i64;
+                if commit_each_batch && count % (BATCH_SIZE as i64 * 8) == 0 {
+                    let mut progress = Map::new();
+                    progress.insert("done".into(), json!(count));
+                    state.tasks.update_progress(task_id, progress);
+                }
+            }
+            Some(err) => {
+                error = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(t) = tx.take() {
+        if error.is_none() {
+            t.commit().await.map_err(AppError::from)?;
+        } else {
+            let _ = t.rollback().await;
+        }
+    }
+    match producer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(parse_err)) => {
+            let err = match parse_err {
+                dict_parser::ParserError::Validation(msg) => AppError::validation(msg),
+                dict_parser::ParserError::Unsupported(msg) => AppError::validation(msg),
+                other => AppError::internal("parse", other),
+            };
+            return Err(error.unwrap_or(err));
+        }
+        Err(join_err) => return Err(error.unwrap_or_else(|| AppError::internal("join", join_err))),
+    }
+    if let Some(err) = error {
+        return Err(err);
+    }
+    let mut progress = Map::new();
+    progress.insert("done".into(), json!(count));
+    state.tasks.update_progress(task_id, progress);
+    Ok(count)
+}
+
+/// 一批 lite 词头行（≤2000 行）按 500 行/语句切分做多值 INSERT（500×6=3000 参数）。
+/// definition 落空串（列 NOT NULL），source_ordinal 记源文件内定位。
+async fn insert_headword_batch<C: ConnectionTrait>(
+    conn: &C,
+    dictionary_id: i32,
+    batch: &[dict_parser::Headword],
+    generation: i32,
+) -> Result<(), AppError> {
+    const ROWS_PER_STMT: usize = 500;
+    let backend = conn.get_database_backend();
+    for chunk in batch.chunks(ROWS_PER_STMT) {
+        let mut sql = String::with_capacity(128 + chunk.len() * 60);
+        sql.push_str(
+            "INSERT INTO dict_entries (dictionary_id, word, word_lower, definition, generation, source_ordinal) VALUES ",
+        );
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 6);
+        let mut param_index = 1usize;
+        for (i, headword) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            for col in 0..6 {
+                if col > 0 {
+                    sql.push(',');
+                }
+                match backend {
+                    sea_orm::DbBackend::Postgres => sql.push_str(&format!("${param_index}")),
+                    _ => sql.push('?'),
+                }
+                param_index += 1;
+            }
+            sql.push(')');
+            values.push(dictionary_id.into());
+            values.push(headword.word.clone().into());
+            values.push(headword.word.to_lowercase().into());
+            values.push(String::new().into());
+            values.push(generation.into());
+            values.push(headword.ordinal.into());
+        }
+        conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+    }
+    Ok(())
 }
 
 /// 一批词条（≤2000 行）按 500 行/语句切分做多值 INSERT。
@@ -1118,6 +1522,87 @@ async fn resolve_target_dictionaries(
 
 /// 登记「重新解析」后台任务；dictionary_ids 为空表示全部词典。
 /// 修「同名词词条被 UNIQUE 去重丢掉」的历史数据用：全量重灌新一代、原子切换。
+/// 切换词典的词条模式（lite↔full）：后台按新模式重灌词条。
+/// lite→full 是 FTS 等高级查询的前提（释义落库）；full→lite 释放磁盘。
+/// 与重解析共用代切换管线：写下一代 → 原子切 active_generation → 清旧代。
+/// 返回 (task_id, 是否实际发起转换)。
+pub async fn start_mode_switch(
+    state: &Arc<AppState>,
+    dictionary_id: i32,
+    mode: &str,
+) -> Result<(i64, bool), AppError> {
+    if !matches!(mode, "full" | "lite") {
+        return Err(AppError::validation("mode 须为 full 或 lite"));
+    }
+    let dictionary = get_dictionary(&state.db, dictionary_id).await?;
+    if mode == "lite" && !matches!(dictionary.format.as_str(), "mdict" | "stardict") {
+        return Err(AppError::validation("该格式不支持 lite 模式"));
+    }
+    if dictionary.entry_mode == mode {
+        return Ok((0, false));
+    }
+    // 源文件缺失时提前报错（别让词典卡在半切换状态）
+    let paths = source_paths_for(&state.db, dictionary_id).await?;
+    if paths.is_empty() {
+        return Err(AppError::validation(format!(
+            "找不到「{}」的源文件，无法转换",
+            dictionary.name
+        )));
+    }
+
+    // 与手动重解析互斥（同词典并发重灌拒绝）
+    {
+        let mut reparsing = state.reparsing.lock().unwrap_or_else(|e| e.into_inner());
+        if reparsing.contains(&dictionary_id) {
+            return Err(AppError::conflict("该词典正在重新解析，请等它结束"));
+        }
+        reparsing.insert(dictionary_id);
+    }
+    // 先落新模式：reparse_one 按词典当前模式重灌；转换失败旧代原封不动、可重试
+    state
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            "UPDATE dictionaries SET entry_mode = $1 WHERE id = $2",
+            [mode.into(), dictionary_id.into()],
+        ))
+        .await?;
+    let mut target = dictionary.clone();
+    target.entry_mode = mode.to_string();
+
+    let task_id = state.tasks.start(
+        "dictionary_mode_switch",
+        &format!("转换「{}」为 {}", target.name, if mode == "full" { "全量模式" } else { "轻量模式" }),
+        false,
+    );
+    let state2 = state.clone();
+    let mode_label = mode.to_string();
+    tokio::spawn(async move {
+        let _guard = state2.bulk_write.lock().await;
+        let result = reparse_one(&state2, task_id, &target, &paths, 0, 1).await;
+        state2.reparsing.lock().unwrap_or_else(|e| e.into_inner()).remove(&dictionary_id);
+        match result {
+            Ok(count) => {
+                let _ = audit_service::log_action(
+                    &state2.db,
+                    "admin",
+                    None,
+                    "dictionary.mode_switch",
+                    Some(&dictionary_id.to_string()),
+                    Some(json!({"to": mode_label, "entries": count})),
+                )
+                .await;
+                state2.tasks.succeed(
+                    task_id,
+                    json!({"dictionary_id": dictionary_id, "mode": mode_label, "entries": count}),
+                )
+            }
+            Err(err) => state2.tasks.fail(task_id, err.message),
+        }
+    });
+    Ok((task_id, true))
+}
+
 pub async fn start_reparse(
     state: &Arc<AppState>,
     dictionary_ids: Option<&[i32]>,
@@ -1219,23 +1704,29 @@ async fn reparse_one(
     let res_dir = Path::new(&state.cfg.dictionary_storage_path)
         .join(dict_id.to_string())
         .join("res");
-    // 勾了「不导入发音/图片」的词典没有 res/，resource_dir=None：释义不做引用改写，
-    // 与当初导入时的行为一致
-    let resource_dir = res_dir.is_dir().then_some(res_dir);
 
-    let result = import_entries_into(
-        state,
-        task_id,
-        dict_id,
-        &dictionary.format,
-        paths,
-        resource_dir,
-        true,  // 引用始终改写（与默认导入一致）
-        false, // 资源只补缺失
-        next_generation,
-        true,  // 每批提交
-    )
-    .await;
+    // 按词典当前模式重灌（lite↔full 切换 = 先改 entry_mode 再走这里）
+    let result = if dictionary.entry_mode == "lite" {
+        import_headwords_into(state, task_id, dict_id, &dictionary.format, paths, next_generation, true)
+            .await
+    } else {
+        // 勾了「不导入发音/图片」的词典没有 res/，resource_dir=None：释义不做引用改写，
+        // 与当初导入时的行为一致
+        let resource_dir = res_dir.is_dir().then_some(res_dir);
+        import_entries_into(
+            state,
+            task_id,
+            dict_id,
+            &dictionary.format,
+            paths,
+            resource_dir,
+            true,  // 引用始终改写（与默认导入一致）
+            false, // 资源只补缺失
+            next_generation,
+            true,  // 每批提交
+        )
+        .await
+    };
     let count = match result {
         Ok(count) => count,
         Err(err) => {
@@ -1254,8 +1745,9 @@ async fn reparse_one(
             [next_generation.into(), count.into(), dict_id.into()],
         ))
         .await?;
-    // 缓存里还是上一代的条目（条目 id 已换）
+    // 缓存里还是上一代的条目（条目 id 已换）；lite 释义缓存按序号取数，一并失效
     state.query_cache.invalidate();
+    state.definition_resources.invalidate_all();
     purge_generations(&state.db, dict_id, Some(next_generation), false).await?;
     // 旧一代清完后主键区间才稳定，这时才能失效随机区间缓存
     state.random_bounds.invalidate_all();
@@ -1683,18 +2175,19 @@ fn schedule_vacuum(state: &AppState) {
 
 /// 词典测试查询：前缀匹配（不限启用状态），按 word_lower 排序
 pub async fn test_query(
-    db: &DatabaseConnection,
+    state: &AppState,
     dictionary_id: i32,
     word: &str,
     limit: i64,
 ) -> Result<Vec<Value>, AppError> {
+    let db = &state.db;
     get_dictionary(db, dictionary_id).await?;
     let word_lower = word.trim().to_lowercase();
     let (lower, upper) = crate::services::entry_scope::word_lower_prefix_bounds(&word_lower);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
-            "SELECT e.id, e.word, e.phonetic, e.definition, e.extra FROM dict_entries e \
+            "SELECT e.id, e.word, e.phonetic, e.definition, e.extra, e.source_ordinal FROM dict_entries e \
              JOIN dictionaries d ON e.dictionary_id = d.id AND e.generation = d.active_generation \
              WHERE e.dictionary_id = $1 AND e.word_lower >= $2 AND e.word_lower < $3 \
              ORDER BY e.word_lower LIMIT $4",
@@ -1706,21 +2199,36 @@ pub async fn test_query(
             ],
         ))
         .await?;
-    Ok(rows
-        .iter()
-        .map(|row| {
-            json!({
-                "word": row.try_get::<String>("", "word").unwrap_or_default(),
-                "phonetic": row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
-                "definition": row.try_get::<String>("", "definition").unwrap_or_default(),
-                "extra": row
-                    .try_get::<Option<String>>("", "extra")
-                    .ok()
-                    .flatten()
-                    .and_then(|s: String| serde_json::from_str::<Value>(&s).ok()),
-            })
-        })
-        .collect())
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        // lite 远程行：测试查询也显示物化释义（每条 ≤2 跳：物化 + 可能的 @@@LINK）
+        let mut definition = row.try_get::<String>("", "definition").unwrap_or_default();
+        let ordinal = row.try_get::<Option<i64>>("", "source_ordinal")
+            .ok()
+            .flatten();
+        if definition.is_empty() {
+            if let Some(ordinal) = ordinal {
+                if let Some(def) = crate::services::mdx_resources::materialize_definition(
+                    state, dictionary_id, ordinal,
+                )
+                .await
+                {
+                    definition = (*def).clone();
+                }
+            }
+        }
+        out.push(json!({
+            "word": row.try_get::<String>("", "word").unwrap_or_default(),
+            "phonetic": row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
+            "definition": definition,
+            "extra": row
+                .try_get::<Option<String>>("", "extra")
+                .ok()
+                .flatten()
+                .and_then(|s: String| serde_json::from_str::<Value>(&s).ok()),
+        }));
+    }
+    Ok(out)
 }
 
 /// 按当前采样逻辑重新识别一部词典的语言方向（只读源文件不写库）

@@ -6,9 +6,11 @@ import type {
   DictionaryUpdatePayload,
   DictsDirListing,
   ImportFromDictsDirPayload,
+  ImportUploadedPayload,
   RenameDictionariesPayload,
   RenameDictionariesResult,
   TestQueryEntry,
+  UploadedAnalysis,
 } from '../../types/dictionary'
 
 export function listDictionaries() {
@@ -19,6 +21,27 @@ export function uploadDictionary(form: FormData) {
   return request.post<never, { task_id: number }>('/admin/dictionaries', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
   })
+}
+
+// 上传文件/文件夹/压缩包：服务器解压分组（不导入），返回识别出的词典组
+export function analyzeUpload(form: FormData) {
+  return request.post<never, UploadedAnalysis>('/admin/dictionaries/analyze-upload', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 0,
+  })
+}
+
+// 导入 analyze-upload 识别出的一组（文件从暂存区移入词典归档）
+export function importUploaded(payload: ImportUploadedPayload) {
+  return request.post<never, { task_id: number }>('/admin/dictionaries/import-uploaded', payload)
+}
+
+// 切换词条模式：lite（词头挂载）与 full（释义落库，FTS 等高级查询的前提）
+export function switchEntryMode(id: number, mode: 'full' | 'lite') {
+  return request.post<never, { task_id: number | null; changed: boolean }>(
+    `/admin/dictionaries/${id}/entry-mode`,
+    { mode },
+  )
 }
 
 export function listDictsDirFiles(path = '', recursive = false) {

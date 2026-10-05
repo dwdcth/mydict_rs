@@ -12,6 +12,9 @@ pub struct Model {
     pub definition: String,
     pub extra: Option<String>,
     pub generation: i32,
+    /// 轻量挂载行：源文件内定位（mdx 词条序号 / stardict idx 下标）。
+    /// NULL = 全量行（definition 已落库）；远程行 definition 为空串，查询期物化。
+    pub source_ordinal: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -310,6 +310,46 @@ async function reparseDictionaries() {
   }
 }
 
+// --- 词条模式切换（lite ↔ full）---
+const switchingIds = ref<number[]>([])
+
+/**
+ * 切换词条存储模式：lite（词头挂载，磁盘省、导入快）与 full（释义落库，全文检索等
+ * 高级功能的前提）。后台自动重灌词条，期间旧词条照常可查，完成时一次性切换。
+ */
+async function switchMode(item: DictionaryItem) {
+  const target = item.entry_mode === 'full' ? 'lite' : 'full'
+  const toLabel = target === 'full' ? '全量（释义落库）' : '轻量（只落词头）'
+  try {
+    await ElMessageBox.confirm(
+      target === 'full'
+        ? `将把「${item.name}」转为全量模式：重读源文件、把释义写入数据库（全文检索等高级功能的前提）。` +
+            '后台自动进行，期间照常可查；大词典转换要几分钟到几十分钟，数据库会临时多占约一部词典的体积。'
+        : `将把「${item.name}」转为轻量模式：词条里只保留词头，释义改回按需读源文件（释放数据库空间）。` +
+            '后台自动进行，期间照常可查。',
+      `切换为${toLabel}`,
+      { type: 'warning', confirmButtonText: '开始转换' },
+    )
+  } catch {
+    return
+  }
+  switchingIds.value = [...switchingIds.value, item.id]
+  try {
+    const { changed, task_id: taskId } = await dictApi.switchEntryMode(item.id, target)
+    if (!changed) {
+      ElMessage.info('该词典已是目标模式，无需转换')
+      return
+    }
+    const task = await waitForImportTask(taskId!, 6 * 60 * 60 * 1000)
+    ElMessage.success(
+      `已切换为${toLabel}：${(resultNumber(task, 'entries') ?? 0).toLocaleString()} 条`,
+    )
+    await loadDictionaries()
+  } finally {
+    switchingIds.value = switchingIds.value.filter((id) => id !== item.id)
+  }
+}
+
 // --- 导入弹窗 ---
 const importDialogVisible = ref(false)
 
@@ -422,9 +462,12 @@ async function runTestQuery() {
         <span class="col-name">
           <span class="dict-name-text" :title="item.name">{{ item.name }}</span>
         </span>
-        <span class="col-format"
-          ><el-tag size="small">{{ item.format }}</el-tag></span
-        >
+        <span class="col-format">
+          <el-tag size="small">{{ item.format }}</el-tag>
+          <el-tag v-if="item.entry_mode === 'lite'" size="small" type="warning" class="mode-tag"
+            >lite</el-tag
+          >
+        </span>
         <span class="col-lang"
           >{{ langLabel(item.lang_from) }} → {{ langLabel(item.lang_to) }}</span
         >
@@ -440,6 +483,19 @@ async function runTestQuery() {
           <el-button text @click="openEdit(item)">编辑</el-button>
           <el-button text type="danger" @click="confirmDelete(item)">删除</el-button>
           <el-button text @click="openTestQuery(item)">测试查询</el-button>
+          <el-button
+            v-if="item.format !== 'ecdict'"
+            text
+            :loading="switchingIds.includes(item.id)"
+            :title="
+              item.entry_mode === 'full'
+                ? '转为轻量：只留词头，释义按需读源文件，释放库容'
+                : '转为全量：释义落库，全文检索等高级功能的前提'
+            "
+            @click="switchMode(item)"
+          >
+            {{ item.entry_mode === 'full' ? '转轻量' : '转全量' }}
+          </el-button>
         </span>
       </div>
 
@@ -642,11 +698,11 @@ async function runTestQuery() {
   /* 名称列与操作列放宽：词典名可能很长，操作列要放得下三个按钮 */
   grid-template-columns:
     var(--size-control-md) var(--size-control-md)
-    minmax(0, 2fr) 1fr 1fr 0.8fr 0.8fr minmax(220px, 1.8fr);
+    minmax(0, 2fr) 1fr 1fr 0.8fr 0.8fr minmax(280px, 2.2fr);
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
-  min-width: 980px;
+  min-width: 1040px;
 }
 
 .dict-list-header {
@@ -696,6 +752,10 @@ async function runTestQuery() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.mode-tag {
+  margin-left: var(--space-1);
 }
 
 .col-actions {

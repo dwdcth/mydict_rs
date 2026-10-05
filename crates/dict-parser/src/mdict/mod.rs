@@ -17,6 +17,7 @@ use mdictlib::{MddFile, MdxFile};
 use crate::entry::{
     is_informative, is_informative_headword, spread_downsample, ParsedEntry, SAMPLE_SCAN_FACTOR,
 };
+use crate::Headword;
 use crate::resources as res;
 use crate::{ParseOpts, ParserError, Result};
 
@@ -37,6 +38,23 @@ struct Opened {
     backend: Backend,
     sheet: HashMap<String, (String, String)>,
     compact: bool,
+}
+
+/// 打开 MDX 的完整路由（probe → mdictlib → Unsupported 回退 opendict）。
+/// 提取为关联函数：并行解析的每个 worker 要各自打开独立句柄。
+fn open_backend(mdx_path: &PathBuf) -> Result<Opened> {
+    match probe_family(mdx_path) {
+        Some(MdictFamily::Opendict) => MdictParser::open_opendict(mdx_path),
+        Some(MdictFamily::Mdictlib) | None => match MdictParser::open_mdictlib(mdx_path) {
+            Ok(opened) => Ok(opened),
+            Err(ParserError::Unsupported(reason)) => {
+                // probe 失败的文件可能是 mdictlib 不认识的版本（如 v3 加密头）——回退
+                tracing::info!(reason = %reason, "mdictlib 不支持，回退 opendict 后端");
+                MdictParser::open_opendict(mdx_path)
+            }
+            Err(other) => Err(other),
+        },
+    }
 }
 
 enum Backend {
@@ -79,23 +97,12 @@ impl MdictParser {
             .first()
             .ok_or_else(|| ParserError::Validation("MDict 词典缺少 .mdx 文件".into()))?;
 
-        let opened = match probe_family(mdx_path) {
-            Some(MdictFamily::Opendict) => self.open_opendict(mdx_path)?,
-            Some(MdictFamily::Mdictlib) | None => match self.open_mdictlib(mdx_path) {
-                Ok(opened) => opened,
-                Err(ParserError::Unsupported(reason)) => {
-                    // probe 失败的文件可能是 mdictlib 不认识的版本（如 v3 加密头）——回退
-                    tracing::info!(reason = %reason, "mdictlib 不支持，回退 opendict 后端");
-                    self.open_opendict(mdx_path)?
-                }
-                Err(other) => return Err(other),
-            },
-        };
+        let opened = open_backend(mdx_path)?;
         self.opened = Some(opened);
         Ok(self.opened.as_mut().expect("just set"))
     }
 
-    fn open_mdictlib(&self, mdx_path: &PathBuf) -> Result<Opened> {
+    fn open_mdictlib(mdx_path: &PathBuf) -> Result<Opened> {
         let options = mdictlib::OpenOptions::default().with_limits(large_limits());
         let mdx = MdxFile::open_with_options(mdx_path, &options)
             .map_err(map_mdictlib_err(mdx_path))?;
@@ -109,7 +116,7 @@ impl MdictParser {
         })
     }
 
-    fn open_opendict(&self, mdx_path: &PathBuf) -> Result<Opened> {
+    fn open_opendict(mdx_path: &PathBuf) -> Result<Opened> {
         let dir = mdx_path
             .parent()
             .ok_or_else(|| ParserError::Validation("MDX 路径没有父目录".into()))?;
@@ -144,18 +151,7 @@ impl MdictParser {
             Backend::Opendict { dict } => dict.entry_count() as u64,
         };
         for ordinal in 0..total {
-            let (word, text) = match &self.opened.as_ref().expect("opened").backend {
-                Backend::Mdictlib { mdx, .. } => {
-                    let entry = mdx
-                        .entry_at(mdictlib::KeyOrdinal::from(ordinal))
-                        .map_err(|e| ParserError::Internal(format!("读取词条失败: {e}")))?
-                        .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?;
-                    (entry.key().to_string(), entry.text().to_string())
-                }
-                Backend::Opendict { dict } => dict
-                    .entry_at(ordinal as usize)?
-                    .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?,
-            };
+            let (word, text) = entry_text_at(self.opened.as_ref().expect("opened"), ordinal)?;
             // 先展开 `N` 样式标记、再改写资源引用：样式表的标签里本身可能含 src/href
             let mut definition = expand_style_markers(&text, &sheet, compact);
             if let Some(opts) = rewrite_opts {
@@ -169,6 +165,91 @@ impl MdictParser {
             }
         }
         Ok(())
+    }
+
+    /// lite 物化：按源文件内序号读单条释义（只解压所在 record 块）。
+    /// 处理管线与全量导入一致：样式展开 → 资源引用改写（rewrite_with=Some(词典id) 时）。
+    pub fn definition_at(
+        &mut self,
+        files: &[PathBuf],
+        ordinal: i64,
+        rewrite_with: Option<i32>,
+    ) -> Result<String> {
+        let (mdx_paths, _) = Self::split_files(files);
+        let (sheet, compact) = {
+            let opened = self.ensure_opened(&mdx_paths)?;
+            (opened.sheet.clone(), opened.compact)
+        };
+        let text = match &self.opened.as_ref().expect("opened").backend {
+            Backend::Mdictlib { mdx, .. } => mdx
+                .entry_at(mdictlib::KeyOrdinal::from(ordinal as u64))
+                .map_err(|e| ParserError::Internal(format!("读取词条失败: {e}")))?
+                .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?
+                .text()
+                .to_string(),
+            Backend::Opendict { dict } => {
+                dict.entry_at(ordinal as usize)?
+                    .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?
+                    .1
+            }
+        };
+        let mut definition = expand_style_markers(&text, &sheet, compact);
+        if let Some(dictionary_id) = rewrite_with {
+            definition = res::rewrite_resource_refs(&definition, dictionary_id);
+        }
+        Ok(definition)
+    }
+
+    /// 轻量模式：只枚举词头与源文件内序号（纯 key 索引，不解压任何 record 块）
+    fn for_each_headword(
+        &mut self,
+        files: &[PathBuf],
+        mut sink: impl FnMut(Headword) -> Result<()>,
+    ) -> Result<()> {
+        let (mdx_paths, _) = Self::split_files(files);
+        self.ensure_opened(&mdx_paths)?;
+        let total = match &self.opened.as_ref().expect("opened").backend {
+            Backend::Mdictlib { mdx, .. } => mdx.len(),
+            Backend::Opendict { dict } => dict.entry_count() as u64,
+        };
+        for ordinal in 0..total {
+            let word = match &self.opened.as_ref().expect("opened").backend {
+                Backend::Mdictlib { mdx, .. } => {
+                    let Some(key) = mdx
+                        .key_at(mdictlib::KeyOrdinal::from(ordinal))
+                        .map_err(|e| ParserError::Internal(format!("读词头失败: {e}")))?
+                    else {
+                        continue;
+                    };
+                    key.key().to_string()
+                }
+                Backend::Opendict { dict } => match dict.word_at(ordinal as usize) {
+                    Some(word) => word.to_string(),
+                    None => continue,
+                },
+            };
+            sink(Headword {
+                word,
+                ordinal: ordinal as i64,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// 在已打开的句柄上按序号读一条 (word, 原始释义文本)
+fn entry_text_at(opened: &Opened, ordinal: u64) -> Result<(String, String)> {
+    match &opened.backend {
+        Backend::Mdictlib { mdx, .. } => {
+            let entry = mdx
+                .entry_at(mdictlib::KeyOrdinal::from(ordinal))
+                .map_err(|e| ParserError::Internal(format!("读取词条失败: {e}")))?
+                .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?;
+            Ok((entry.key().to_string(), entry.text().to_string()))
+        }
+        Backend::Opendict { dict } => Ok(dict
+            .entry_at(ordinal as usize)?
+            .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?),
     }
 }
 
@@ -297,6 +378,128 @@ impl super::DictionaryParser for MdictParser {
             index += step;
         }
         Ok(spread_downsample(collected, limit))
+    }
+
+    fn parse_headwords(
+        &mut self,
+        files: &[PathBuf],
+        emit: &mut dyn FnMut(Vec<Headword>) -> Result<()>,
+    ) -> Result<()> {
+        let (mdx_paths, _) = Self::split_files(files);
+        if mdx_paths.is_empty() {
+            return Err(ParserError::Validation("MDict 词典缺少 .mdx 文件".into()));
+        }
+        self.ensure_opened(&mdx_paths)?;
+        let mut batch: Vec<Headword> = Vec::with_capacity(2000);
+        self.for_each_headword(files, |headword| {
+            batch.push(headword);
+            if batch.len() >= 2000 {
+                let out = std::mem::take(&mut batch);
+                emit(out)?;
+            }
+            Ok(())
+        })?;
+        if !batch.is_empty() {
+            emit(batch)?;
+        }
+        Ok(())
+    }
+
+    fn parse_parallel(
+        &mut self,
+        files: &[PathBuf],
+        opts: &ParseOpts,
+        workers: usize,
+        emit: &mut dyn FnMut(Vec<ParsedEntry>) -> Result<()>,
+    ) -> Result<()> {
+        let (mdx_paths, _) = Self::split_files(files);
+        if mdx_paths.is_empty() {
+            return Err(ParserError::Validation("MDict 词典缺少 .mdx 文件".into()));
+        }
+        // 资源解包/兄弟复制是一次性的，留在主线程串行做
+        if let Some(resource_dir) = &opts.resource_dir {
+            self.extract_mdd_resources(files, resource_dir, opts.overwrite_resources)?;
+            res::copy_sibling_resources(resource_dir, files);
+        }
+
+        // 探路一次拿总条数（worker 各自再打开独立句柄）
+        self.ensure_opened(&mdx_paths)?;
+        let total = match &self.opened.as_ref().expect("opened").backend {
+            Backend::Mdictlib { mdx, .. } => mdx.len(),
+            Backend::Opendict { dict } => dict.entry_count() as u64,
+        } as usize;
+        if total == 0 {
+            return Ok(());
+        }
+        // CPU 占用控制：worker 数封顶（导入任务本身经 bulk_write 串行排队，
+        // 多词典同时转换也不会叠加并行度）；sync_channel(2) 提供批间背压
+        let workers = workers.clamp(1, 16).min(total);
+        let chunk = total.div_ceil(workers);
+        let rewrite = opts.rewrite_refs;
+        let dictionary_id = opts.dictionary_id;
+        let mdx_path = (*mdx_paths[0]).clone();
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<ParsedEntry>>(2);
+        let mut first_error: Option<ParserError> = None;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for k in 0..workers {
+                let lo = k * chunk;
+                let hi = (lo + chunk).min(total);
+                if lo >= hi {
+                    break;
+                }
+                let tx = tx.clone();
+                let path = mdx_path.clone();
+                handles.push(scope.spawn(move || -> Result<()> {
+                    let opened = open_backend(&path)?;
+                    let mut batch: Vec<ParsedEntry> = Vec::with_capacity(2000);
+                    for ordinal in lo as u64..hi as u64 {
+                        let (word, text) = entry_text_at(&opened, ordinal)?;
+                        let mut definition =
+                            expand_style_markers(&text, &opened.sheet, opened.compact);
+                        if rewrite {
+                            definition = res::rewrite_resource_refs(&definition, dictionary_id);
+                        }
+                        batch.push(ParsedEntry::new(word, definition));
+                        if batch.len() >= 2000 {
+                            // 接收端已退出（emit 出错）→ 提前收工，不算错误
+                            if tx.send(std::mem::take(&mut batch)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    let _ = tx.send(batch);
+                    Ok(())
+                }));
+            }
+            drop(tx);
+            // 主线程排空通道 → 单线程顺序回调 emit（DB 插入侧不并行）
+            let mut emit_error: Option<ParserError> = None;
+            while let Ok(batch) = rx.recv() {
+                if let Err(e) = emit(batch) {
+                    emit_error = Some(e);
+                    break;
+                }
+            }
+            // 先 drop 接收端再 join：阻塞中的 worker send 失败后自行退出
+            drop(rx);
+            first_error = emit_error;
+            for handle in handles {
+                let outcome = handle.join().unwrap_or_else(|_| {
+                    Err(ParserError::Internal("解析线程崩溃".into()))
+                });
+                if let Err(e) = outcome {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        });
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(())
     }
 }
 

@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use mdictlib::{KeyOrdinal, MddFile, MdxFile};
+use dict_parser::DictionaryParser;
 use opendict::mdict::MdictDictionary;
 use opendict::stardict::StarDictDictionary;
 
@@ -296,4 +297,151 @@ fn stardict_dz_roundtrip() {
         !dir.join("test.dict").exists(),
         "cache_to_disk=false 不应落盘解压后的 .dict"
     );
+}
+
+// ── lite 模式：词头枚举 + 按序号物化释义 ──────────────────────────
+
+/// 收集某解析器枚举出的全部词头
+fn collect_headwords<P: dict_parser::DictionaryParser>(
+    parser: &mut P,
+    files: &[std::path::PathBuf],
+) -> Vec<dict_parser::Headword> {
+    let mut all = Vec::new();
+    parser
+        .parse_headwords(files, &mut |batch| {
+            all.extend(batch);
+            Ok(())
+        })
+        .expect("parse_headwords");
+    all
+}
+
+#[test]
+fn lite_mdx_v2_headwords_match_full_parse() {
+    let dir = corpus("mdx_v2_rich");
+    if !require_dir(&dir) {
+        return;
+    }
+    let files = vec![dir.join("rich.mdx")];
+    let mut parser = dict_parser::mdict::MdictParser::new();
+    let headwords = collect_headwords(&mut parser, &files);
+
+    // 词头数 = 全量条目数，序号连续 0..n
+    let mut full_words = Vec::new();
+    parser
+        .parse(&files, &dict_parser::ParseOpts::new(7), &mut |batch| {
+            full_words.extend(batch.iter().map(|e| e.word.clone()));
+            Ok(())
+        })
+        .expect("parse");
+    assert_eq!(headwords.len(), full_words.len(), "lite 词头数应等于全量条目数");
+    for (i, hw) in headwords.iter().enumerate() {
+        assert_eq!(hw.ordinal, i as i64);
+        assert_eq!(hw.word, full_words[i], "序号 {i} 的词头应与全量一致");
+    }
+
+    // definition_at：appel 是 @@@LINK 行、apple2 二跳、apple 承载真释义
+    let by_word = |w: &str| headwords.iter().find(|h| h.word == w).expect(w).ordinal;
+    let appel = parser
+        .definition_at(&files, by_word("appel"), None)
+        .expect("appel 释义");
+    assert_eq!(appel.trim(), "@@@LINK=apple2");
+    let apple = parser
+        .definition_at(&files, by_word("apple"), Some(7))
+        .expect("apple 释义");
+    assert!(apple.contains("苹果") || apple.contains("apple"), "{apple}");
+    // 越界序号报错而非 panic
+    assert!(parser.definition_at(&files, headwords.len() as i64, None).is_err());
+}
+
+#[test]
+fn lite_mdx_v3_headwords_and_definition() {
+    let dir = corpus("mdx_v3_basic");
+    if !require_dir(&dir) {
+        return;
+    }
+    let files = vec![dir.join("v3.mdx")];
+    let mut parser = dict_parser::mdict::MdictParser::new();
+    let headwords = collect_headwords(&mut parser, &files);
+    assert!(!headwords.is_empty(), "v3 语料应有词头");
+    for (i, hw) in headwords.iter().enumerate() {
+        assert_eq!(hw.ordinal, i as i64);
+    }
+    let ord = headwords.iter().find(|h| h.word == "苹果").expect("苹果");
+    let def = parser
+        .definition_at(&files, ord.ordinal, None)
+        .expect("v3 释义物化");
+    assert!(def.contains("apple"), "{def}");
+}
+
+#[test]
+fn lite_stardict_headwords_include_synonyms() {
+    let dir = corpus("stardict_basic");
+    if !require_dir(&dir) {
+        return;
+    }
+    let files = vec![
+        dir.join("test.ifo"),
+        dir.join("test.idx"),
+        dir.join("test.dict"),
+        dir.join("test.syn"),
+    ];
+    let mut parser = dict_parser::stardict::StarDictParser::new();
+    let headwords = collect_headwords(&mut parser, &files);
+    // 8 条主词头 + 2 条别名
+    assert_eq!(headwords.len(), 10);
+    let alias = headwords.iter().find(|h| h.word == "apple fruit").expect("别名");
+    assert_eq!(alias.ordinal, 1, "别名行 ordinal 应指向目标 apple（idx 1）");
+    // 别名物化 = 目标释义
+    let def = parser.definition_at(&files, alias.ordinal).expect("别名释义");
+    assert!(def.contains("苹果"), "{def}");
+    // 主词头物化
+    let main = headwords.iter().find(|h| h.word == "apple").expect("apple");
+    assert_eq!(parser.definition_at(&files, main.ordinal).unwrap(), def);
+    assert!(parser.definition_at(&files, 9999).is_err());
+}
+
+#[test]
+fn lite_ecdict_rejected() {
+    let mut parser = dict_parser::ecdict::EcdictParser;
+    let files = vec![testdata_dir().join("ecdict_mini.csv")];
+    let err = parser
+        .parse_headwords(&files, &mut |_| Ok(()))
+        .expect_err("ECDICT 不支持 lite");
+    assert!(matches!(err, dict_parser::ParserError::Validation(_)));
+}
+
+#[test]
+fn parse_parallel_matches_serial() {
+    let dir = corpus("mdx_v2_rich");
+    if !require_dir(&dir) {
+        return;
+    }
+    let files = vec![dir.join("rich.mdx")];
+
+    let mut serial = Vec::new();
+    let mut p1 = dict_parser::mdict::MdictParser::new();
+    p1.parse(&files, &dict_parser::ParseOpts::new(9), &mut |batch| {
+        serial.extend(batch);
+        Ok(())
+    })
+    .expect("serial parse");
+
+    let mut parallel = Vec::new();
+    let mut p2 = dict_parser::mdict::MdictParser::new();
+    p2.parse_parallel(&files, &dict_parser::ParseOpts::new(9), 3, &mut |batch| {
+        parallel.extend(batch);
+        Ok(())
+    })
+    .expect("parallel parse");
+
+    // 并行 worker 的批次交错，顺序不保证 → 按多重集比较
+    assert_eq!(serial.len(), parallel.len());
+    let mut s: Vec<(String, String)> =
+        serial.into_iter().map(|e| (e.word, e.definition)).collect();
+    let mut p: Vec<(String, String)> =
+        parallel.into_iter().map(|e| (e.word, e.definition)).collect();
+    s.sort();
+    p.sort();
+    assert_eq!(s, p, "并行解析输出应与串行完全一致");
 }

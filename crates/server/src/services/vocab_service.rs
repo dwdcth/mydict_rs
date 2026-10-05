@@ -76,7 +76,7 @@ pub async fn add_vocab_item(
 ) -> Result<Value, AppError> {
     let (entry, resolved_dict_id) = find_entry(state, word, dictionary_id).await?;
     // 快照存真正承载内容的条目（@@@LINK 已解）；词头沿用用户查到的那个
-    let content = query_service::resolve_entry_link(&state.db, &entry).await?;
+    let content = query_service::resolve_entry_link(state, &entry).await?;
 
     // 词条级去重（dictionary_id 为 NULL 时唯一索引管不到，这里兜住）
     let backend = state.db.get_database_backend();
