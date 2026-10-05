@@ -34,7 +34,7 @@ pub fn seal_token(plain: &str, secret: &str) -> Vec<u8> {
     };
     let sealed = cipher
         .encrypt(
-            Nonce::from(&nonce_bytes),
+            *Nonce::from_slice(&nonce_bytes),
             Payload {
                 msg: plain.as_bytes(),
                 aad: b"mydict-token",
@@ -56,7 +56,7 @@ pub fn unseal_token(secret_data: &[u8], secret: &str) -> Option<String> {
     let (nonce_bytes, ct) = secret_data.split_at(12);
     let plain = cipher
         .decrypt(
-            Nonce::from(nonce_bytes),
+            *Nonce::from_slice(nonce_bytes),
             Payload {
                 msg: ct,
                 aad: b"mydict-token",
