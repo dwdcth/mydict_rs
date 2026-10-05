@@ -1,0 +1,10 @@
+/target
+Cargo.lock.bak
+node_modules
+frontend/dist
+/data
+*.sqlite3*
+.env
+.staging/
+# 测试语料（脚本生成，不入库）
+/testdata/

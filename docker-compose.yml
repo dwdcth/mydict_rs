@@ -1,0 +1,17 @@
+services:
+  mydict:
+    image: mydict-rs:latest
+    build: .
+    container_name: mydict
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

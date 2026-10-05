@@ -1,0 +1,62 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MyDict self-hosted dictionary service (Rust rewrite)"
+
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mydict"
+path = "src/main.rs"
+
+[[bin]]
+name = "mydict-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+dict-parser = { path = "../dict-parser" }
+migration = { path = "../migration" }
+actix-web.workspace = true
+actix-files.workspace = true
+actix-multipart.workspace = true
+tokio.workspace = true
+futures.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bcrypt.workspace = true
+jsonwebtoken.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+moka.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+unicode-normalization.workspace = true
+opencc-rs.workspace = true
+encoding_rs.workspace = true
+lol_html.workspace = true
+html-escape.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+base64.workspace = true
+mime.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+actix-http = "3"

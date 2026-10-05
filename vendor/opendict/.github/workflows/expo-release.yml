@@ -1,0 +1,61 @@
+name: Release @opendict-rs/expo
+
+on:
+  push:
+    tags: ['expo-v*']
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mobile
+
+      - name: Build mobile artifacts (XCFramework + .so for all ABIs)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash scripts/build-mobile.sh
+
+      - name: Pack the Expo module
+        working-directory: expo
+        run: |
+          npm install
+          npm pack
+          ls -la *.tgz
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendict-expo-tarball
+          path: expo/*.tgz
+          if-no-files-found: error
+
+      - name: Publish to npm
+        working-directory: expo
+        run: npm publish --access public --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

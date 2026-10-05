@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "vendor/opendict",
+    "crates/dict-parser",
+    "crates/migration",
+    "crates/server",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+[workspace.dependencies]
+# 词典解析
+mdictlib = { version = "0.2.8", features = ["lzo"] }
+opendict-rs = { path = "vendor/opendict" }
+
+# Web / 异步
+actix-web = "4"
+actix-files = "0.6"
+actix-multipart = "0.7"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# 数据库（ORM，多后端：SQLite / PostgreSQL / MySQL）
+sea-orm = { version = "2.0", features = ["sqlx-sqlite", "runtime-tokio", "macros", "with-chrono"] }
+sea-orm-migration = { version = "2.0", features = ["sqlx-sqlite", "runtime-tokio", "with-chrono"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 认证 / 加密
+bcrypt = "0.19"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+sha2 = "0.10"
+aes-gcm = "0.11"
+rand = "0.9"
+
+# 时间
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# 缓存 / 并发
+moka = { version = "0.12", features = ["sync"] }
+
+# 文本处理
+regex = "1"
+fancy-regex = "0.19"
+unicode-normalization = "0.1"
+opencc-rs = "0.6"
+encoding_rs = "0.8"
+flate2 = "1"
+csv = "1"
+lol_html = "1"
+html-escape = "0.2"
+
+# HTTP 客户端（在线词典）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "socks", "json"] }
+
+# 工具
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+mime = "0.3"
+walkdir = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

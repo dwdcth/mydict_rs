@@ -1,0 +1,114 @@
+name: Release opendict (Node)
+
+on:
+  push:
+    tags: ['node-v*']
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            build: npm run build -- --target x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            build: npm run build -- --target aarch64-apple-darwin
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            build: npm run build -- --target x86_64-unknown-linux-gnu --use-napi-cross
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            build: npm run build -- --target aarch64-unknown-linux-gnu --use-napi-cross
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            build: npm run build -- --target x86_64-unknown-linux-musl -x
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            build: npm run build -- --target aarch64-unknown-linux-musl -x
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            build: npm run build -- --target x86_64-pc-windows-msvc
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            build: npm run build -- --target aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # musl targets cross-compile via cargo-zigbuild, which needs zig on PATH
+      - name: Install zig
+        if: contains(matrix.target, 'musl')
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node -> target
+          shared-key: ${{ matrix.target }}
+
+      - working-directory: node
+        run: npm install
+
+      - name: Build
+        working-directory: node
+        run: ${{ matrix.build }}
+        shell: bash
+
+      - name: Upload .node binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - working-directory: node
+        run: npm install
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: node/artifacts
+
+      - name: Move binaries into per-platform npm dirs
+        working-directory: node
+        run: npx napi artifacts
+
+      - name: Verify packages
+        working-directory: node
+        run: |
+          ls -la npm/*/
+          for d in npm/*/; do cat "$d/package.json"; done
+
+      - name: Publish platform packages and main
+        working-directory: node
+        run: |
+          npm config set //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+          npx napi prepublish -t npm --no-gh-release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

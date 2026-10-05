@@ -1,0 +1,121 @@
+:root {
+  /* 品牌色 */
+  --color-brand-50: #eafbf4;
+  --color-brand-100: #cff5e4;
+  --color-brand-300: #7fddba;
+  --color-brand-500: #2fbf8f;
+  --color-brand-600: #22a67b;
+  --color-brand-700: #178c66;
+  --color-brand-900: #0b4a38;
+
+  /* 中性色 - 浅色主题 */
+  --color-bg-base: #f6f8f7;
+  --color-bg-surface: #ffffff;
+  --color-bg-surface-raised: #ffffff;
+  --color-border: #e4e9e7;
+  --color-border-hover: #c7d1cd;
+  --color-text-primary: #1a2420;
+  --color-text-secondary: #5b6b65;
+  --color-text-tertiary: #8b9a94;
+
+  /* 语义色 - 浅色主题 */
+  --color-success: #2fbf8f;
+  --color-warning: #e8a33d;
+  --color-danger: #e15656;
+  --color-info: #4c8dff;
+
+  /* 行/列表项/图标按钮的 hover 高亮底色。不能直接复用 --color-brand-50——那个值固定
+     浅色，配合 --color-text-primary 这类深浅主题反转的文字在深色主题下会"亮底亮字"看不清；
+     这里单独一个 Token，深色主题换成把品牌色掺进当前表面色得到的深色调。 */
+  --color-hover-tint: var(--color-brand-50);
+
+  /* 滚动条。用细条 + 低对比：浏览器原生滚动条在暗色主题下是一块亮灰色，比页面里
+     任何内容都显眼。track 给 transparent，让它彻底融进底色。 */
+  --color-scrollbar-thumb: #c7d1cd;
+  --color-scrollbar-thumb-hover: #8b9a94;
+  --color-scrollbar-track: transparent;
+
+  /* 词典识别色：生词本卡片左侧色条，按 dictionary_id 取模固定分配 */
+  --color-dict-marine: #1b6e8c;
+  --color-dict-velvet: #7d3c5e;
+  --color-dict-night-blue: #1a2456;
+  --color-dict-green: #2e7d32;
+  --color-dict-yellow: #f9a825;
+  --color-dict-red: #c62828;
+  --color-dict-purple: #6a1b9a;
+  --color-dict-orange: #ef6c00;
+  --color-dict-olive: #827717;
+  --color-dict-brown: #6d4c41;
+
+  /* 全屏遮罩（大图查看器）。刻意不随主题切换：看图时背景要压到接近全黑图片才看得清 */
+  --color-overlay-scrim: rgba(0, 0, 0, 0.86);
+  --color-overlay-control: rgba(0, 0, 0, 0.5);
+  --color-overlay-control-hover: rgba(0, 0, 0, 0.72);
+  --color-overlay-text: #f2f5f4;
+}
+
+:root[data-theme='dark'] {
+  --color-bg-base: #12161a;
+  --color-bg-surface: #1b2126;
+  --color-bg-surface-raised: #232b31;
+  --color-border: #2c363d;
+  --color-border-hover: #3c4850;
+  --color-text-primary: #eaf1ee;
+  --color-text-secondary: #9db0aa;
+  --color-text-tertiary: #71827c;
+
+  --color-success: #3fd8a3;
+  --color-warning: #f0b85c;
+  --color-danger: #f1726f;
+  --color-info: #6fa2ff;
+
+  --color-hover-tint: color-mix(in srgb, var(--color-brand-500) 18%, var(--color-bg-surface));
+
+  --color-scrollbar-thumb: #3c4850;
+  --color-scrollbar-thumb-hover: #71827c;
+
+  --color-dict-marine: #4fa8c7;
+  --color-dict-velvet: #b0577f;
+  --color-dict-night-blue: #4a5a9e;
+  --color-dict-green: #66bb6a;
+  --color-dict-yellow: #fdd835;
+  --color-dict-red: #ef5350;
+  --color-dict-purple: #ab47bc;
+  --color-dict-orange: #ffa726;
+  --color-dict-olive: #c0ca33;
+  --color-dict-brown: #a1887f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --color-bg-base: #12161a;
+    --color-bg-surface: #1b2126;
+    --color-bg-surface-raised: #232b31;
+    --color-border: #2c363d;
+    --color-border-hover: #3c4850;
+    --color-text-primary: #eaf1ee;
+    --color-text-secondary: #9db0aa;
+    --color-text-tertiary: #71827c;
+
+    --color-success: #3fd8a3;
+    --color-warning: #f0b85c;
+    --color-danger: #f1726f;
+    --color-info: #6fa2ff;
+
+    --color-hover-tint: color-mix(in srgb, var(--color-brand-500) 18%, var(--color-bg-surface));
+
+    --color-scrollbar-thumb: #3c4850;
+    --color-scrollbar-thumb-hover: #71827c;
+
+    --color-dict-marine: #4fa8c7;
+    --color-dict-velvet: #b0577f;
+    --color-dict-night-blue: #4a5a9e;
+    --color-dict-green: #66bb6a;
+    --color-dict-yellow: #fdd835;
+    --color-dict-red: #ef5350;
+    --color-dict-purple: #ab47bc;
+    --color-dict-orange: #ffa726;
+    --color-dict-olive: #c0ca33;
+    --color-dict-brown: #a1887f;
+  }
+}
