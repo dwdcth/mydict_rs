@@ -113,7 +113,9 @@ pub async fn me(
     app: web::Data<std::sync::Arc<AppState>>,
     user: UserAuth,
 ) -> Result<web::Json<Value>, AppError> {
-    let allowed = crate::core::deps::user_allowed_dictionary_ids(&app.db, &user.0).await;
+    // 对齐 Python：返回用户**自选**的原始值（查询时才与管理员上限求交集），
+    // 管理员改上限不会让前端词典选择器的回显悄悄变样
+    let allowed = crate::core::deps::user_self_selection_ids(&app.db, &user.0).await;
     Ok(web::Json(auth::user_public_json(&user.0, allowed)))
 }
 
@@ -123,7 +125,7 @@ pub async fn set_allowed_dictionaries(
     body: web::Json<AllowedDictionariesRequest>,
 ) -> Result<web::Json<Value>, AppError> {
     let user = auth::set_self_allowed_dictionaries(&app, &user.0, body.dictionary_ids.clone()).await?;
-    let allowed = crate::core::deps::user_allowed_dictionary_ids(&app.db, &user).await;
+    let allowed = crate::core::deps::user_self_selection_ids(&app.db, &user).await;
     Ok(web::Json(auth::user_public_json(&user, allowed)))
 }
 

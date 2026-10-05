@@ -348,7 +348,7 @@ pub async fn get_user_detail(state: &AppState, user_id: i32) -> Result<Value, Ap
         .query_all_raw(Statement::from_sql_and_values(
             state.db.get_database_backend(),
             "SELECT word, status, dictionary_id, duration_ms, created_at FROM query_logs \
-             WHERE user_id = $1 ORDER BY id DESC LIMIT 20",
+             WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 20",
             [user_id.into()],
         ))
         .await?;

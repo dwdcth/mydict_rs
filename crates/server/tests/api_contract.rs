@@ -1204,3 +1204,133 @@ async fn upload_zip_analyze_and_import() {
     let resp = actix_test::call_service(&mut svc, req).await;
     assert_eq!(resp.status().as_u16(), 422);
 }
+
+// ── 词典组（GoldenDict 式命名查询范围）────────────────────────────
+
+#[actix_web::test]
+async fn dictionary_groups_crud_and_isolation() {
+    let app = spawn_app().await;
+    let mut svc = init_service(&app.state).await;
+    let admin = admin_setup(&mut svc).await;
+    let _ = admin;
+    let a_id = seed_dictionary(&app.state, "组员甲", "en", "en", &[("apple", "a")]).await;
+    let b_id = seed_dictionary(&app.state, "组员乙", "zh-Hans", "zh-Hans", &[("苹果", "b")]).await;
+
+    // 两个用户
+    let register = |username: &str| {
+        TestRequest::post()
+            .uri("/api/auth/register")
+            .set_json(serde_json::json!({
+                "username": username,
+                "password": "password123",
+                "email": format!("{username}@t.dev"),
+            }))
+            .to_request()
+    };
+    let _: Value = actix_test::call_and_read_body_json(&mut svc, register("alice")).await;
+    let _: Value = actix_test::call_and_read_body_json(&mut svc, register("bob")).await;
+    let login = |username: &str| {
+        TestRequest::post()
+            .uri("/api/auth/login")
+            .set_json(serde_json::json!({"username": username, "password": "password123"}))
+            .to_request()
+    };
+    let alice: Value = actix_test::call_and_read_body_json(&mut svc, login("alice")).await;
+    let alice_token = alice["access_token"].as_str().unwrap().to_string();
+    let bob: Value = actix_test::call_and_read_body_json(&mut svc, login("bob")).await;
+    let bob_token = bob["access_token"].as_str().unwrap().to_string();
+
+    // 匿名 → 401
+    let req = TestRequest::get().uri("/api/dict/groups").to_request();
+    let resp = actix_test::call_service(&mut svc, req).await;
+    assert_eq!(resp.status().as_u16(), 401);
+
+    // 空列表
+    let req = TestRequest::get()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&alice_token)
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(resp["groups"].as_array().unwrap().len(), 0);
+
+    // 建组（保序）
+    let req = TestRequest::post()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&alice_token)
+        .set_json(serde_json::json!({"name": "精查", "dictionary_ids": [a_id, b_id]}))
+        .to_request();
+    let group: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    let group_id = group["id"].as_i64().unwrap();
+    assert_eq!(
+        group["dictionary_ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect::<Vec<_>>(),
+        vec![a_id as i64, b_id as i64],
+        "组员应保序返回"
+    );
+
+    // 重名 → 409；不存在词典 → 422；空成员 → 422
+    let req = TestRequest::post()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&alice_token)
+        .set_json(serde_json::json!({"name": "精查", "dictionary_ids": [a_id]}))
+        .to_request();
+    assert_eq!(actix_test::call_service(&mut svc, req).await.status().as_u16(), 409);
+    let req = TestRequest::post()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&alice_token)
+        .set_json(serde_json::json!({"name": "坏组", "dictionary_ids": [99999]}))
+        .to_request();
+    assert_eq!(actix_test::call_service(&mut svc, req).await.status().as_u16(), 422);
+    let req = TestRequest::post()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&alice_token)
+        .set_json(serde_json::json!({"name": "空组", "dictionary_ids": []}))
+        .to_request();
+    assert_eq!(actix_test::call_service(&mut svc, req).await.status().as_u16(), 422);
+
+    // 改名 + 全量换成员
+    let req = TestRequest::put()
+        .uri(&format!("/api/dict/groups/{group_id}"))
+        .pipe_bearer(&alice_token)
+        .set_json(serde_json::json!({"name": "精查2", "dictionary_ids": [b_id, a_id]}))
+        .to_request();
+    let updated: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(updated["name"], "精查2");
+    assert_eq!(
+        updated["dictionary_ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect::<Vec<_>>(),
+        vec![b_id as i64, a_id as i64],
+        "成员替换应保新序"
+    );
+
+    // 隔离：bob 看不到 alice 的组，改/删都 404
+    let req = TestRequest::get()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&bob_token)
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(resp["groups"].as_array().unwrap().len(), 0, "组应用户隔离");
+    let req = TestRequest::put()
+        .uri(&format!("/api/dict/groups/{group_id}"))
+        .pipe_bearer(&bob_token)
+        .set_json(serde_json::json!({"name": "抢组"}))
+        .to_request();
+    assert_eq!(actix_test::call_service(&mut svc, req).await.status().as_u16(), 404);
+    let req = TestRequest::delete()
+        .uri(&format!("/api/dict/groups/{group_id}"))
+        .pipe_bearer(&bob_token)
+        .to_request();
+    assert_eq!(actix_test::call_service(&mut svc, req).await.status().as_u16(), 404);
+
+    // 删除
+    let req = TestRequest::delete()
+        .uri(&format!("/api/dict/groups/{group_id}"))
+        .pipe_bearer(&alice_token)
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(resp["ok"], true);
+    let req = TestRequest::get()
+        .uri("/api/dict/groups")
+        .pipe_bearer(&alice_token)
+        .to_request();
+    let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
+    assert_eq!(resp["groups"].as_array().unwrap().len(), 0);
+}

@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import NavBar from '../components/NavBar.vue'
 import SystemTaskBanner from '../components/SystemTaskBanner.vue'
 import DictionaryScopePanel from '../components/DictionaryScopePanel.vue'
+import DictionaryGroupsBar from '../components/DictionaryGroupsBar.vue'
 import EntryPanel from '../components/EntryPanel.vue'
 import OnlineDictPanel from '../components/OnlineDictPanel.vue'
 import RandomDictPanel from '../components/RandomDictPanel.vue'
@@ -180,6 +181,12 @@ const activeTab = computed<string>(() => {
 function onSelectScope(scope: string) {
   onlineMode.value = false
   selectScope(scope)
+}
+
+/** 点词典组：与语言标签同语义——一键切换勾选范围（在线模式退出、随机只换池子） */
+function onSelectGroup(ids: number[]) {
+  onlineMode.value = false
+  setSelection(ids)
 }
 
 function selectOnline() {
@@ -514,6 +521,18 @@ function onRescroll(key: string) {
           >
             随机
           </button>
+        </div>
+
+        <!--
+          词典组（GoldenDict 式）：命名的常用组合，一键切换检索范围。组存服务端，
+          与勾选通道共用查询参数。
+        -->
+        <div v-if="showScope" class="scope-tabs">
+          <DictionaryGroupsBar
+            :dictionaries="dictionaries"
+            :selected-ids="selectedIds"
+            @select="onSelectGroup"
+          />
         </div>
 
         <!--

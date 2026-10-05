@@ -37,19 +37,63 @@ pub struct Settings {
 }
 
 fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    env_value(key).unwrap_or_else(|| default.to_string())
 }
 
 /// bool 解析对齐 pydantic-settings：true/1/yes/on（大小写不敏感）
+/// cwd 的 .env 解析结果（对齐 pydantic-settings 的 env_file=".env"；
+/// 进程环境变量优先，.env 只垫底缺失项）。启动期一次解析、全局只读。
+fn dotenv_map() -> &'static std::collections::HashMap<String, String> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let Ok(content) = std::fs::read_to_string(".env") else {
+            return std::collections::HashMap::new();
+        };
+        let mut map = std::collections::HashMap::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let mut value = value.trim().to_string();
+            if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
+            {
+                value = value[1..value.len() - 1].to_string();
+            }
+            if !key.is_empty() {
+                map.entry(key.to_string()).or_insert(value);
+            }
+        }
+        map
+    })
+}
+
+/// 环境取值：进程 env 优先，其次 .env
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().or_else(|| dotenv_map().get(key).cloned())
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"),
-        Err(_) => default,
+    match env_value(key).as_deref() {
+        // pydantic 布尔解析集合：y/yes/t/true/on/1（大小写不敏感）
+        Some(v) => matches!(
+            v.to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on" | "y" | "t"
+        ),
+        None => default,
     }
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env_value(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// 0 = 自动：核数一半、封顶 4（CPU 留余量，多词典导入也不叠满核）
@@ -64,7 +108,7 @@ fn effective_import_workers(configured: usize) -> usize {
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env_value(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 impl Settings {

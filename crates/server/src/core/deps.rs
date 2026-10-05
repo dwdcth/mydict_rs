@@ -224,6 +224,18 @@ pub async fn get_web_caller(req: &HttpRequest, state: &AppState) -> Result<WebCa
 /// 用户的「实际可用词典」= 管理员上限 ∩ 用户自选。
 /// Python 版 user_allowed_dictionary_ids：limit 为 None 取 own；own 为 None 取 limit；
 /// 交集空退回 limit（避免自选一个不存在的词典型把自己锁死）。
+/// 用户**自选**的词典 id 原始值（/api/auth/me 等展示用；查询授权用 user_allowed_dictionary_ids）
+pub async fn user_self_selection_ids(
+    db: &DatabaseConnection,
+    user: &user::Model,
+) -> Option<Vec<i32>> {
+    if user.self_scope_limited != 0 {
+        crate::services::scope::self_granted_ids(db, user.id).await.ok()
+    } else {
+        None
+    }
+}
+
 pub async fn user_allowed_dictionary_ids(
     db: &DatabaseConnection,
     user: &user::Model,

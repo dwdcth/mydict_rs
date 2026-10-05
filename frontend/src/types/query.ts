@@ -18,6 +18,14 @@ export interface QueryResponse {
   results: QueryResultItem[]
 }
 
+/** 词典组（GoldenDict 式）：用户自建的命名查询范围，dictionary_ids 保序 */
+export interface DictionaryGroup {
+  id: number
+  name: string
+  dictionary_ids: number[]
+  created_at: number
+}
+
 export interface PublicDictionary {
   id: number
   name: string

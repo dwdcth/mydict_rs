@@ -6,6 +6,7 @@ pub mod query_expand;
 pub mod random_entry;
 pub mod audit_service;
 pub mod background_task;
+pub mod dict_group;
 pub mod dictionary;
 pub mod entry_scope;
 pub mod scope;

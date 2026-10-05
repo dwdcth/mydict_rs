@@ -28,7 +28,7 @@ pub async fn update_settings(
     };
     let fields_present: Vec<String> = obj.keys().cloned().collect();
     Ok(web::Json(
-        admin_settings_service::update_settings(&app.db, obj, &fields_present, &app.cfg, _admin.0.id)
+        admin_settings_service::update_settings(&app, obj, &fields_present, &app.cfg, _admin.0.id)
             .await?,
     ))
 }

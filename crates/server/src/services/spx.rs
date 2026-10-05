@@ -62,14 +62,13 @@ pub async fn transcode_to_mp3(source: &Path) -> Option<PathBuf> {
     }
     let source = source.to_path_buf();
     let target2 = target.clone();
+    // 中转目录建在源文件父目录（.spx- 前缀），成功后 rename 原子落位；
+    // 放在超时块外创建——超时取消后外层还能清理（对齐 Python with 上下文的清理保证）
+    let parent = source.parent()?.to_path_buf();
+    let work = parent.join(format!(".spx-{}", uuid::Uuid::new_v4().simple()));
+    tokio::fs::create_dir_all(&work).await.ok()?;
+    let work_outer = work.clone();
     let result = tokio::time::timeout(Duration::from_secs(TIMEOUT_SECONDS), async move {
-        // 中转目录建在源文件父目录（.spx- 前缀），成功后 rename 原子落位
-        let parent = source.parent()?;
-        let work = parent.join(format!(
-            ".spx-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        tokio::fs::create_dir_all(&work).await.ok()?;
         let wav = work.join("out.wav");
         let mp3_tmp = work.join("out.mp3");
         async fn cleanup(work: &Path) {
@@ -102,6 +101,14 @@ pub async fn transcode_to_mp3(source: &Path) -> Option<PathBuf> {
             cleanup(&work).await;
             return None;
         }
+        // 对齐 Python：产物必须非空（speexdec 对坏输入可能成功退出但产出 0 字节）
+        match tokio::fs::metadata(&mp3_tmp).await {
+            Ok(meta) if meta.len() > 0 => {}
+            _ => {
+                cleanup(&work).await;
+                return None;
+            }
+        }
         if tokio::fs::rename(&mp3_tmp, &target2).await.is_err() {
             cleanup(&work).await;
             return None;
@@ -110,5 +117,10 @@ pub async fn transcode_to_mp3(source: &Path) -> Option<PathBuf> {
         Some(target2)
     })
     .await;
-    result.ok().flatten()
+    let outcome = result.ok().flatten();
+    if outcome.is_none() {
+        // 超时取消/失败：兜底清理中转目录（内部路径通常已自清，这里保证幂等）
+        let _ = tokio::fs::remove_dir_all(&work_outer).await;
+    }
+    outcome
 }

@@ -97,13 +97,17 @@ pub async fn dict_resource(
         let source = match res::resolve_resource_file(&res_dir, &spx_rel) {
             Some(path) => Some(path),
             None => {
-                // 从 .mdd 读出 .spx 字节 → 落临时文件再转码
+                // 从 .mdd 读出 .spx 字节 → 唯一临时名（避免并发互踩）→ 转码
                 match crate::services::mdd_resources::lookup_resource(&app, dictionary_id, &spx_rel).await {
                     Some(bytes) => {
                         let res_dir = res_dir.clone();
                         match tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {
                             std::fs::create_dir_all(&res_dir)?;
-                            let tmp = res_dir.join(format!(".spx-src-{}", std::process::id()));
+                            let tmp = res_dir.join(format!(
+                                ".spx-src-{}-{}",
+                                std::process::id(),
+                                uuid::Uuid::new_v4().simple()
+                            ));
                             std::fs::write(&tmp, bytes.as_slice())?;
                             Ok(tmp)
                         })
@@ -119,8 +123,27 @@ pub async fn dict_resource(
         };
         if let Some(source) = source {
             if let Some(mp3) = crate::services::spx::transcode_to_mp3(&source).await {
-                let media_type = res::resource_media_type(&mp3);
-                return match NamedFile::open(&mp3) {
+                // 临时 .spx 用完即删；产物落到**请求名**（下次直接磁盘命中，对齐 Python
+                // 导入期解包后转码落正确名字的缓存语义）
+                let _ = tokio::fs::remove_file(&source).await;
+                let normalized2 = normalized.clone();
+                let res_dir2 = res_dir.clone();
+                let mp3_fallback = mp3.clone();
+                let cached = tokio::task::spawn_blocking(move || -> Option<PathBuf> {
+                    let bytes = std::fs::read(&mp3).ok()?;
+                    // mp3 临时产物（.spx-src-*.mp3）也一并清掉
+                    let _ = std::fs::remove_file(&mp3);
+                    res::write_resource(&res_dir2, &normalized2, &bytes, false)
+                        .ok()
+                        .map(|_| res_dir2.join(normalized2.trim_start_matches('/')))
+                })
+                .await
+                .ok()
+                .flatten();
+                // 落盘成功用缓存名，失败回退临时产物
+                let serve_path = cached.unwrap_or(mp3_fallback);
+                let media_type = res::resource_media_type(&serve_path);
+                return match NamedFile::open(&serve_path) {
                     Ok(file) => dict_res_headers(
                         file.disable_content_disposition()
                             .set_content_type(parse_mime(media_type))

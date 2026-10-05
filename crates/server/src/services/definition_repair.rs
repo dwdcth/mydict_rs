@@ -48,6 +48,41 @@ async fn is_lite_dictionary(state: &AppState, dictionary_id: i32) -> Result<bool
         .unwrap_or(false))
 }
 
+/// 统计三部类坏链各自行数（CLI 逐部报告用）
+pub async fn count_legacy_links(
+    state: &AppState,
+    dictionary_id: i32,
+) -> Result<(i64, i64, i64), AppError> {
+    if is_lite_dictionary(state, dictionary_id).await? {
+        return Ok((0, 0, 0));
+    }
+    let (entry_from, sound_from, file_from) = prefixes(dictionary_id);
+    let backend = state.db.get_database_backend();
+    let row = state
+        .db
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT \
+                SUM(CASE WHEN definition LIKE '%' || $1 || '%' THEN 1 ELSE 0 END) AS e, \
+                SUM(CASE WHEN definition LIKE '%' || $2 || '%' THEN 1 ELSE 0 END) AS s, \
+                SUM(CASE WHEN definition LIKE '%' || $3 || '%' THEN 1 ELSE 0 END) AS f \
+             FROM dict_entries WHERE dictionary_id = $4",
+            [
+                entry_from.clone().into(),
+                sound_from.clone().into(),
+                file_from.clone().into(),
+                dictionary_id.into(),
+            ],
+        ))
+        .await?;
+    let row = row.ok_or_else(|| AppError::not_found("词典不存在"))?;
+    Ok((
+        row.try_get::<i64>("", "e").unwrap_or(0),
+        row.try_get::<i64>("", "s").unwrap_or(0),
+        row.try_get::<i64>("", "f").unwrap_or(0),
+    ))
+}
+
 pub async fn repair_legacy_links(
     state: &AppState,
     dictionary_id: i32,
@@ -274,18 +309,21 @@ pub fn source_style_context(
     (HashMap::new(), false)
 }
 
-/// 轻量读 .mdx 头的 StyleSheet/Compact（只读头几千字节，不加载词头索引）
+/// 轻量读 .mdx 头的 StyleSheet/Compact（只读头部所需字节，不加载词头索引，
+/// 也不把整个文件读进内存——GB 级词典的修复任务不该吃几个 GB 的 RSS）
 fn read_style_context_from_mdx(path: &Path) -> Option<(HashMap<String, (String, String)>, bool)> {
     use dict_parser::mdict::parse_stylesheet;
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() < 8 {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len_buf = [0u8; 4];
+    file.read_exact(&mut len_buf).ok()?;
+    let header_len = u32::from_be_bytes(len_buf) as usize;
+    // 防御：异常长度（加密头/坏文件）直接放弃（对齐 probe 的上限）
+    if header_len == 0 || header_len > 16 * 1024 * 1024 {
         return None;
     }
-    let header_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    if bytes.len() < 4 + header_len {
-        return None;
-    }
-    let header_bytes = &bytes[4..4 + header_len];
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes).ok()?;
     // 头可能是 UTF-16LE 或 UTF-8
     let text = if header_bytes.len() % 2 == 0 {
         let units: Vec<u16> = header_bytes
@@ -294,7 +332,7 @@ fn read_style_context_from_mdx(path: &Path) -> Option<(HashMap<String, (String, 
             .collect();
         String::from_utf16_lossy(&units)
     } else {
-        String::from_utf8_lossy(header_bytes).into_owned()
+        String::from_utf8_lossy(&header_bytes).into_owned()
     };
     let extract_attr = |key: &str| -> Option<String> {
         let pattern = Regex::new(&format!(r#"(?i){key}\s*=\s*["']([^"']*)["']"#)).ok()?;

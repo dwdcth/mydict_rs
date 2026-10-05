@@ -404,6 +404,10 @@ impl super::DictionaryParser for StarDictParser {
             // target 落在一条记录中间：先跳过当前被截断记录的尾部字段才是下一条起点
             let Some(zero) = chunk.iter().position(|&b| b == 0) else { continue };
             let start = zero + record_tail;
+            // 首 NUL 距块尾不足一条记录的尾部字段时跳过该窗口（防越界 panic，对齐 Python 守卫）
+            if start >= chunk.len() {
+                continue;
+            }
             let Some(end) = chunk[start..].iter().position(|&b| b == 0) else { continue };
             let end = start + end;
             let word = String::from_utf8_lossy(&chunk[start..end]).into_owned();

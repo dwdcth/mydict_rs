@@ -4,6 +4,7 @@
 //! 该键是响应超集（前端忽略未知字段），不影响契约。
 
 use sea_orm::DatabaseConnection;
+use crate::AppState;
 use serde_json::{json, Map, Value};
 
 use crate::core::config::Settings;
@@ -138,7 +139,7 @@ async fn get_optional_int(db: &DatabaseConnection, key: &str) -> Result<Option<i
 
 /// updates 只处理 fields_present 里实际出现过的字段，区分「未传」与「显式传 null」。
 pub async fn update_settings(
-    db: &DatabaseConnection,
+    state: &std::sync::Arc<AppState>,
     updates: &Map<String, Value>,
     fields_present: &[String],
     defaults: &Settings,
@@ -157,14 +158,14 @@ pub async fn update_settings(
             .unwrap_or(false)
     {
         warm_random =
-            !settings_service::get_bool_setting(db, "random_browse_enabled", false).await?;
+            !settings_service::get_bool_setting(&state.db, "random_browse_enabled", false).await?;
     }
 
     let mut changed = Map::new();
     for key in fields_present {
         if key == "online_dict_proxy" {
             let value = save_online_dict_proxy(
-                db,
+                &state.db,
                 updates.get(key).and_then(|v| v.as_str()),
                 defaults,
             )
@@ -186,26 +187,26 @@ pub async fn update_settings(
             } else {
                 value.as_i64().unwrap_or(0).to_string()
             };
-            settings_service::set_setting(db, key, &stored).await?;
+            settings_service::set_setting(&state.db, key, &stored).await?;
         } else if BOOL_KEYS.contains(&key.as_str()) {
             let flag = value.as_bool().unwrap_or(false);
-            settings_service::set_setting(db, key, if flag { "true" } else { "false" }).await?;
+            settings_service::set_setting(&state.db, key, if flag { "true" } else { "false" }).await?;
         } else if INT_KEYS.contains(&key.as_str()) {
-            settings_service::set_setting(db, key, &value.as_i64().unwrap_or(0).to_string())
+            settings_service::set_setting(&state.db, key, &value.as_i64().unwrap_or(0).to_string())
                 .await?;
         } else {
             let mut text = value.as_str().unwrap_or_default().to_string();
             if key == "online_dict_sources" {
                 text = normalize_online_sources(Some(&text));
             }
-            settings_service::set_setting(db, key, &text).await?;
+            settings_service::set_setting(&state.db, key, &text).await?;
         }
         changed.insert(key.clone(), value);
     }
 
     if !changed.is_empty() {
         audit_service::log_action(
-            db,
+            &state.db,
             "admin",
             Some(admin_id),
             "settings.update",
@@ -214,10 +215,15 @@ pub async fn update_settings(
         )
         .await?;
     }
+    // 「随机浏览」从关改开时立即后台预热主键区间（对齐 Python：
+    // 否则开启后第一个点随机的用户要付一次全区间扫描的代价）
     if warm_random {
-        // M4：随机区间预热（random_entry_service::warm_bounds_in_background）
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            crate::services::random_entry::warm_bounds_in_background(&state2).await;
+        });
     }
-    get_all_settings(db, defaults)
+    get_all_settings(&state.db, defaults)
         .await
         .map_err(AppError::from)
 }

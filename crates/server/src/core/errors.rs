@@ -47,7 +47,7 @@ impl AppError {
         Self::new(StatusCode::FORBIDDEN, "forbidden", message)
     }
     pub fn registration_disabled() -> Self {
-        Self::new(StatusCode::FORBIDDEN, "registration_disabled", "当前未开放注册")
+        Self::new(StatusCode::FORBIDDEN, "registration_disabled", "当前不允许注册")
     }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)

@@ -210,22 +210,32 @@ pub async fn list_vocab_items(
     params: &VocabListParams,
 ) -> Result<(Vec<Value>, i64), AppError> {
     let backend = state.db.get_database_backend();
-    let mut where_parts = vec![format!("v.{} = {}", kind.owner_col(), owner_id)];
+    // 用户可控的 search/lang 一律参数化（Python 走 SQLAlchemy 参数绑定）
+    let mut where_sql = format!("v.{} = {}", kind.owner_col(), owner_id);
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let mut ph = crate::services::query::PhPub::new(backend);
     if let Some(search) = params.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        where_parts.push(format!("v.word LIKE '%{}%'", search.replace('\'', "''")));
+        let p = ph.take();
+        where_sql.push_str(&format!(" AND v.word LIKE '%' || {p} || '%'"));
+        values.push(search.into());
     }
     if let Some(lang) = params.lang_from.as_deref().filter(|s| !s.is_empty()) {
         // JOIN dictionaries 过滤来源语言
-        where_parts.push(format!(
-            "v.dictionary_id IN (SELECT id FROM dictionaries WHERE lang_from = '{lang}')"
+        let p = ph.take();
+        where_sql.push_str(&format!(
+            " AND v.dictionary_id IN (SELECT id FROM dictionaries WHERE lang_from = {p})"
         ));
+        values.push(lang.to_string().into());
     }
-    let where_sql = where_parts.join(" AND ");
     let total: i64 = state
         .db
-        .query_one_raw(Statement::from_string(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
-            format!("SELECT COUNT(*) AS n FROM {} v WHERE {where_sql}", kind.table()),
+            format!(
+                "SELECT COUNT(*) AS n FROM {} v WHERE {where_sql}",
+                kind.table()
+            ),
+            values.clone(),
         ))
         .await?
         .and_then(|r| r.try_get("", "n").ok())
@@ -237,7 +247,7 @@ pub async fn list_vocab_items(
     let dir = if params.order == "asc" { "ASC" } else { "DESC" };
     let rows = state
         .db
-        .query_all_raw(Statement::from_string(
+        .query_all_raw(Statement::from_sql_and_values(
             backend,
             format!(
                 "SELECT v.* FROM {} v WHERE {where_sql} ORDER BY {sort_col} {dir}, v.id {dir} LIMIT {} OFFSET {}",
@@ -245,6 +255,7 @@ pub async fn list_vocab_items(
                 params.page_size,
                 (params.page - 1).max(0) * params.page_size
             ),
+            values,
         ))
         .await?;
     Ok((rows.iter().map(vocab_row_to_json).collect(), total))

@@ -157,11 +157,20 @@ pub async fn entry(
     if word.is_empty() {
         return Err(AppError::not_found("词条不存在"));
     }
-    // entry_ids 解析：逗号分割→正整数→去重排序→截 200；无效回退按词路径
+    // theme 枚举校验（对齐 Python Literal["light","dark"]）
+    if let Some(theme) = params.theme.as_deref() {
+        if !matches!(theme, "light" | "dark") {
+            return Err(AppError::validation("theme 只能是 light 或 dark"));
+        }
+    }
+    // entry_ids 解析：任一段非法就整体回退按词路径（对齐 Python 的 int() 全有全无）
     let entry_ids: Option<Vec<i32>> = params.entry_ids.as_deref().and_then(|raw| {
         let ids: Vec<i32> = raw
             .split(',')
-            .filter_map(|p| p.trim().parse::<i32>().ok())
+            .map(|p| p.trim().parse::<i32>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?
+            .into_iter()
             .filter(|id| *id > 0)
             .collect();
         if ids.is_empty() {

@@ -80,7 +80,7 @@ pub async fn enforce_entry_rate(
         Ok(())
     } else {
         Err(AppError::rate_limited(
-            "请求过于频繁，请稍后再试",
+            "词条加载过于频繁，请稍后再试",
             MinuteCounters::seconds_to_next_minute(),
         ))
     }
@@ -101,7 +101,7 @@ pub async fn enforce_online_rate(
         Ok(())
     } else {
         Err(AppError::rate_limited(
-            "请求过于频繁，请稍后再试",
+            "在线词典查询过于频繁，请稍后再试",
             MinuteCounters::seconds_to_next_minute(),
         ))
     }
@@ -135,7 +135,7 @@ pub async fn enforce_api_anonymous_rate(state: &AppState, ip: &str) -> Result<()
     )
     .await;
     Err(AppError::rate_limited(
-        "请求过于频繁，请稍后再试",
+        "匿名调用过于频繁，请稍后再试",
         MinuteCounters::seconds_to_next_minute(),
     ))
 }

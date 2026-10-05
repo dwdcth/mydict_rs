@@ -41,14 +41,57 @@ static ACTIVE_PROXY: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(Str
 
 struct OnlineState {
     client: reqwest::Client,
+    /// 走当前代理的维基专用客户端（代理串变化时重建；百度百科恒直连）
+    proxy_client: RwLock<(String, reqwest::Client)>,
 }
 
 static STATE: LazyLock<OnlineState> = LazyLock::new(|| OnlineState {
+    // 重定向不跟随（对齐 Python httpx 默认 follow_redirects=False：302 视为源不可用）
     client: reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("reqwest client"),
+    proxy_client: RwLock::new((String::new(), reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client"))),
 });
+
+/// 维基两源出站客户端：配置了代理则走代理（对齐 Python 每请求带 proxy=…）
+fn wiki_client() -> reqwest::Client {
+    let proxy = active_proxy();
+    let guard = STATE
+        .proxy_client
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.0.is_empty() || guard.0 != proxy {
+        drop(guard);
+        let mut guard = STATE
+            .proxy_client
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.0 != proxy {
+            let builder = reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none());
+            let built = if proxy.is_empty() {
+                builder.build()
+            } else {
+                match reqwest::Proxy::all(&proxy) {
+                    Ok(p) => builder.proxy(p).build(),
+                    Err(_) => builder.build(),
+                }
+            };
+            if let Ok(client) = built {
+                *guard = (proxy, client);
+            }
+        }
+        return guard.1.clone();
+    }
+    guard.1.clone()
+}
 
 fn active_proxy() -> String {
     ACTIVE_PROXY
@@ -124,8 +167,7 @@ async fn fetch_wikipedia(word: &str, lang: &str) -> Result<Option<Value>, String
         "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{}",
         encode_word(word)
     );
-    let resp = STATE
-        .client
+    let resp = wiki_client()
         .get(&url)
         .header("User-Agent", "mydict-dictionary/1.0 (self-hosted dictionary server)")
         .header("Api-User-Agent", "mydict-dictionary/1.0 (self-hosted dictionary server)")
@@ -185,8 +227,7 @@ async fn fetch_wiktionary(word: &str, lang: &str) -> Result<Option<Value>, Strin
         "https://en.wiktionary.org/api/rest_v1/page/definition/{}",
         encode_word(word)
     );
-    let resp = STATE
-        .client
+    let resp = wiki_client()
         .get(&url)
         .header("User-Agent", "mydict-dictionary/1.0 (self-hosted dictionary server)")
         .header("Api-User-Agent", "mydict-dictionary/1.0 (self-hosted dictionary server)")

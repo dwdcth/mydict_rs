@@ -24,11 +24,15 @@ const BLOCK_TAGS: [&str; 11] = ["p", "div", "br", "li", "tr", "h1", "h2", "h3", 
 /// 块级标签起止各插一个换行；实体解码；行 strip、去空行。
 /// 对齐 Python HTMLParser(convert_charrefs=True) 行为。
 pub fn html_to_plain_text(html: &str) -> String {
+    // 对齐 Python _HtmlTextExtractor（convert_charrefs + 末尾再 unescape = 实体双解）：
+    // - `<` 后不是标签起始字符（字母/!/?//）时当纯文本（HTMLParser 行为）
+    // - 标签名只收第一段（属性值等于块级标签名时不能误插换行）
+    // - 行切分用 Python splitlines 的分行符集（\n \r \v \f \x1c-\x1e \x85 \u2028 \u2029）
     let mut text = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut tag_name = String::new();
-    let mut entity_start: Option<usize> = None;
-    let bytes: Vec<char> = html.chars().collect();
+    let mut name_done = false;
+    let chars: Vec<char> = html.chars().collect();
     let mut i = 0usize;
     let mut literal = String::new();
 
@@ -41,50 +45,86 @@ pub fn html_to_plain_text(html: &str) -> String {
         };
     }
 
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c == '<' {
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '<' && !in_tag {
+            // 前瞻：`</TAG`、`<!…`、`<?…` 是标签；`< 数字/< 空格/< 汉字` 等按文本处理
+            let mut j = i + 1;
+            if j < chars.len() && chars[j] == '/' {
+                j += 1;
+            }
+            let tag_like = j < chars.len()
+                && (chars[j].is_ascii_alphabetic() || chars[j] == '!' || chars[j] == '?');
+            if !tag_like {
+                literal.push('<');
+                i += 1;
+                continue;
+            }
             flush_literal!();
             in_tag = true;
             tag_name.clear();
+            name_done = false;
             i += 1;
-            // 跳过 </ 的斜杠与标签名前的空白
-            while i < bytes.len() && (bytes[i] == '/' || bytes[i].is_whitespace()) {
+            // 跳过 </ 的斜杠
+            if i < chars.len() && chars[i] == '/' {
                 i += 1;
             }
             continue;
         }
         if in_tag {
-            if c.is_ascii_alphanumeric() {
+            if !name_done && c.is_ascii_alphanumeric() {
                 tag_name.push(c.to_ascii_lowercase());
             } else {
-                // 标签名结束（遇空格、属性、> 等）；若是块级标签插换行。
-                // 注意：纯扫描不解析属性值里的 '>'（真实词典释义没有这种写法，
-                // Python 的 HTMLParser 同样按第一个 '>' 收尾）
-                if !tag_name.is_empty() && BLOCK_TAGS.contains(&tag_name.as_str()) {
-                    text.push('\n');
+                if !name_done {
+                    // 标签名到此为止；之后的属性段不再重收名字
+                    name_done = true;
+                    if !tag_name.is_empty() && BLOCK_TAGS.contains(&tag_name.as_str()) {
+                        text.push('\n');
+                    }
+                    tag_name.clear();
                 }
                 if c == '>' {
                     in_tag = false;
                 }
-                tag_name.clear();
             }
             i += 1;
             continue;
         }
         // 文本
         literal.push(c);
-        let _ = entity_start.take();
         i += 1;
     }
     flush_literal!();
-    let lines: Vec<String> = text
-        .lines()
+    // Python：unescape("".join(parts)) —— 第二次解码
+    let text = decode_entities(&text);
+    let lines: Vec<String> = py_splitlines(&text)
+        .into_iter()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .map(String::from)
         .collect();
     lines.join("\n")
+}
+
+/// Python str.splitlines 的分行符集（比 `\n` 宽：\v \f \x1c-\x1e \x85 \u2028 \u2029）
+fn py_splitlines(text: &str) -> Vec<&str> {
+    const SEPS: &[char] = &[
+        '\n', '\r', '\u{0b}', '\u{0c}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{85}', '\u{2028}',
+        '\u{2029}',
+    ];
+    // 末尾分隔符不产生空段（对齐 splitlines）
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (idx, c) in text.char_indices() {
+        if SEPS.contains(&c) {
+            lines.push(&text[start..idx]);
+            start = idx + c.len_utf8();
+        }
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
 }
 
 /// 常见字符实体解码（html-escape crate 的 decode）
@@ -103,13 +143,13 @@ pub fn detect_lang(word: &str) -> &'static str {
     }
 }
 
-/// 解析 `dict=a,b,c`；空串与无有效数字视为「不限制」，非法项忽略
+/// 解析 `dict=a,b,c`；空串与无有效数字视为「不限制」，非法项忽略。
+/// 0 保留在集合里（对齐 Python 的 isdigit 语义：`dict=0` 匹配不到任何词典 → 空结果）。
 pub fn parse_dict_ids(raw: Option<&str>) -> Option<Vec<i32>> {
     let raw = raw?;
     let ids: Vec<i32> = raw
         .split(',')
         .filter_map(|part| part.trim().parse::<i32>().ok())
-        .filter(|id| *id > 0)
         .collect();
     (!ids.is_empty()).then_some(ids)
 }
@@ -159,14 +199,19 @@ pub async fn resolve_candidates(
     allowed_ids: Option<&[i32]>,
     all_langs: bool,
 ) -> Result<CandidateSet, AppError> {
+    // 对齐 Python 的优先级：dict_ids 非空时直接定候选（lang_from/to 被忽略）——
+    // 用户点名了词典就不该再被语言过滤收窄
     let rows = enabled_dictionaries(db, allowed_ids).await?;
-    let rows = match dict_ids {
-        Some(ids) if !ids.is_empty() => {
-            let idset: HashSet<i32> = ids.iter().copied().collect();
-            rows.into_iter().filter(|d| idset.contains(&d.id)).collect()
-        }
-        _ => rows,
-    };
+    if let Some(ids) = dict_ids.filter(|ids| !ids.is_empty()) {
+        let idset: HashSet<i32> = ids.iter().copied().collect();
+        let rows: Vec<dictionary::Model> =
+            rows.into_iter().filter(|d| idset.contains(&d.id)).collect();
+        let preferred: HashSet<i32> = rows.iter().map(|d| d.id).collect();
+        return Ok(CandidateSet {
+            dictionaries: rows,
+            preferred_ids: preferred,
+        });
+    }
     if let Some(lang_from) = lang_from.filter(|s| !s.is_empty()) {
         let wanted = lang_from_values(lang_from);
         let mut scoped: Vec<dictionary::Model> = rows
@@ -179,13 +224,6 @@ pub async fn resolve_candidates(
         let ids: HashSet<i32> = scoped.iter().map(|d| d.id).collect();
         return Ok(CandidateSet {
             dictionaries: scoped,
-            preferred_ids: ids,
-        });
-    }
-    if dict_ids.is_some() {
-        let ids: HashSet<i32> = rows.iter().map(|d| d.id).collect();
-        return Ok(CandidateSet {
-            dictionaries: rows,
             preferred_ids: ids,
         });
     }
@@ -264,6 +302,26 @@ pub fn sql_placeholders(backend: sea_orm::DbBackend, count: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// 占位符发生器（跨模块公开版，vocab 等动态 WHERE 用）
+pub struct PhPub {
+    backend: sea_orm::DbBackend,
+    next: usize,
+}
+
+impl PhPub {
+    pub fn new(backend: sea_orm::DbBackend) -> Self {
+        Self { backend, next: 1 }
+    }
+    pub fn take(&mut self) -> String {
+        let n = self.next;
+        self.next += 1;
+        match self.backend {
+            sea_orm::DbBackend::Postgres => format!("${n}"),
+            _ => "?".to_string(),
+        }
+    }
 }
 
 /// 占位符发生器：按 SQL 文本中的出现顺序取号（PG 用 $N、SQLite 用 ?），
@@ -724,17 +782,16 @@ pub async fn get_entries_for_document(
             prefix_fallback_entries(db, &word_lower, dictionary_id).await?
         };
     }
-    // 几条跳到同一个目标的只留一份
-    let mut resolved: Vec<(i32, EntryRow)> = Vec::new();
+    // 几条跳到同一个目标的只留一份；顺序 = 首次出现顺序（对齐 Python 的 dict 插入序）
+    let mut resolved: Vec<EntryRow> = Vec::new();
     let mut seen: HashSet<i32> = HashSet::new();
     for entry in &entries {
         let target = resolve_link(state, entry).await?;
         if seen.insert(target.id) {
-            resolved.push((target.id, target));
+            resolved.push(target);
         }
     }
-    resolved.sort_by_key(|(id, _)| *id);
-    Ok(resolved.into_iter().map(|(_, e)| e).collect())
+    Ok(resolved)
 }
 
 /// 前缀联想：候选词典前缀区间读 limit*3 行，去重后截断

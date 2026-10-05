@@ -2,6 +2,7 @@ import request from './request'
 import { currentTheme } from '../composables/useTheme'
 import type {
   OnlineLookup,
+  DictionaryGroup,
   PublicDictionary,
   QueryHistoryEntry,
   QueryResponse,
@@ -38,6 +39,30 @@ export function randomEntry(dictIds?: number[]) {
 /**
  * 需要登录。`usable`：当前用户能用的词典（首页检索范围）；`all`：全部已启用词典（词典选择弹窗）。
  */
+// ── 词典组（GoldenDict 式命名查询范围，登录用户专属）────────────
+
+export function listDictionaryGroups() {
+  return request.get<never, { groups: DictionaryGroup[] }>('/dict/groups')
+}
+
+export function createDictionaryGroup(name: string, dictionaryIds: number[]) {
+  return request.post<never, DictionaryGroup>('/dict/groups', {
+    name,
+    dictionary_ids: dictionaryIds,
+  })
+}
+
+export function updateDictionaryGroup(
+  id: number,
+  payload: { name?: string; dictionary_ids?: number[] },
+) {
+  return request.put<never, DictionaryGroup>(`/dict/groups/${id}`, payload)
+}
+
+export function deleteDictionaryGroup(id: number) {
+  return request.delete<never, { ok: boolean }>(`/dict/groups/${id}`)
+}
+
 export function listDictionaries(scope: 'usable' | 'all' = 'usable') {
   return request.get<never, PublicDictionary[]>('/dict/dictionaries', { params: { scope } })
 }

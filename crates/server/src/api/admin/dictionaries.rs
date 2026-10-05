@@ -372,6 +372,83 @@ pub async fn import_from_dicts_dir(
     Ok(web::Json(json!({"task_id": task_id})))
 }
 
+// ── 管理端词条预览（测试查询 iframe 用）──────────────────────────
+
+#[derive(Deserialize)]
+pub struct AdminEntryQuery {
+    pub word: String,
+    pub theme: Option<String>,
+}
+
+/// GET /api/admin/dictionaries/{id}/entry —— 管理端预览单条词条的 HTML 文档。
+/// 与前台 /api/dict/entry 的区别：**不检查启用状态**（测试查询的对象常常正是
+/// 还没启用的词典），也不做用户授权过滤（管理员天然全量）。allow_lookup 关闭
+/// （管理端预览不需要选中查词）。
+pub async fn entry_document(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+    path: web::Path<i32>,
+    params: web::Query<AdminEntryQuery>,
+) -> Result<actix_web::HttpResponse, AppError> {
+    let _admin = require_admin(&req, &app).await?;
+    let dictionary_id = path.into_inner();
+    let _dictionary = dict_service::get_dictionary(&app.db, dictionary_id).await?;
+
+    let word = params.word.trim();
+    if word.is_empty() {
+        return Err(AppError::not_found("词条不存在"));
+    }
+    let entries = crate::services::query::get_entries_for_document(
+        &app,
+        dictionary_id,
+        word,
+        None,
+    )
+    .await?;
+    if entries.is_empty() {
+        return Err(AppError::not_found("词条不存在"));
+    }
+
+    // 同名 .css/.js 注入（磁盘 res/ + .mdd 兜底）
+    let source_files: Vec<PathBuf> =
+        crate::services::dictionary::source_paths_for(&app.db, dictionary_id)
+            .await
+            .unwrap_or_default();
+    let res_dir = std::path::Path::new(&app.cfg.dictionary_storage_path)
+        .join(dictionary_id.to_string())
+        .join("res");
+    let mut extra_assets: Vec<(String, String)> = Vec::new();
+    for source in &source_files {
+        if let Some(name) = source.file_name().and_then(|n| n.to_str()) {
+            if name.to_lowercase().ends_with(".mdx") {
+                extra_assets = crate::services::mdd_resources::same_name_assets_with_mdd(
+                    &app, dictionary_id, &res_dir, name,
+                )
+                .await;
+            }
+        }
+    }
+
+    let render_entries: Vec<crate::services::entry_render::RenderEntry<'_>> = entries
+        .iter()
+        .map(|e| crate::services::entry_render::RenderEntry {
+            word: &e.word,
+            definition: &e.definition,
+            phonetic: e.phonetic.as_deref(),
+        })
+        .collect();
+    let doc = crate::services::entry_render::render_entries_document(
+        &render_entries,
+        dictionary_id,
+        params.theme.as_deref(),
+        false, // 管理端预览：不开选中查词
+        &extra_assets,
+    );
+    Ok(actix_web::HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(doc))
+}
+
 // ── 词条模式切换（lite↔full）─────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -728,6 +805,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/admin/dictionaries/{id}/disable", web::put().to(disable))
         .route("/admin/dictionaries/{id}", web::delete().to(delete_one))
         .route("/admin/dictionaries/{id}/test-query", web::get().to(test_query))
+        .route("/admin/dictionaries/{id}/entry", web::get().to(entry_document))
         .route(
             "/admin/dictionaries/{id}/cleanup-uss-speakers",
             web::post().to(cleanup_uss_speakers),

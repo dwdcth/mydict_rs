@@ -106,7 +106,7 @@ pub async fn list_dictionaries(db: &DatabaseConnection) -> Result<Vec<crate::ent
         .await?)
 }
 
-async fn get_dictionary(
+pub async fn get_dictionary(
     db: &DatabaseConnection,
     dictionary_id: i32,
 ) -> Result<crate::entities::dictionary::Model, AppError> {
@@ -1855,17 +1855,17 @@ pub async fn set_dictionaries_status(
     for id in &unique {
         get_dictionary(&state.db, *id).await?;
     }
+    // 状态变更与审计日志同一事务提交（对齐 Python：任何一步失败整批回滚）
+    let tx = state.db.begin().await.map_err(AppError::from)?;
     for id in &unique {
-        state
-            .db
-            .execute_raw(Statement::from_sql_and_values(
-                state.db.get_database_backend(),
-                "UPDATE dictionaries SET status = $1 WHERE id = $2",
-                [status.into(), (*id).into()],
-            ))
-            .await?;
-        audit_service::log_action(
-            &state.db,
+        tx.execute_raw(Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            "UPDATE dictionaries SET status = $1 WHERE id = $2",
+            [status.into(), (*id).into()],
+        ))
+        .await?;
+        audit_service::log_action_tx(
+            &tx,
             "admin",
             Some(admin_id),
             &format!("dictionary.{status}"),
@@ -1874,6 +1874,7 @@ pub async fn set_dictionaries_status(
         )
         .await?;
     }
+    tx.commit().await.map_err(AppError::from)?;
     state.query_cache.invalidate();
     Ok(list_dictionaries(&state.db)
         .await?
@@ -2022,7 +2023,8 @@ pub async fn reorder_dictionaries(
     admin_id: i32,
 ) -> Result<Vec<Value>, AppError> {
     if ordered_ids.is_empty() {
-        return Err(AppError::validation("排序列表不能为空"));
+        // 对齐 Python：空列表静默成功（等价无操作）
+        return Ok(list_dictionaries(&state.db).await?.iter().map(dict_to_json).collect());
     }
     let dicts = list_dictionaries(&state.db).await?;
     let known: std::collections::HashMap<i32, ()> =

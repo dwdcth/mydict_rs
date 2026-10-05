@@ -145,9 +145,7 @@ pub async fn entry(
         }
         None => definition.unwrap_or_default(),
     };
-    if definition.is_empty() {
-        return Err(AppError::not_found("词条不存在"));
-    }
+    // 对齐 Python：空快照渲染空文档（而不是 404——收藏项本身还在）
 
     // 同名 css/js（词典还在才注入）
     let mut extra_assets: Vec<(String, String)> = Vec::new();

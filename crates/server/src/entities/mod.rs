@@ -8,6 +8,8 @@ pub mod admin_dict_grant;
 pub mod api_token;
 pub mod audit_log;
 pub mod dictionary;
+pub mod dictionary_group;
+pub mod dictionary_group_item;
 pub mod dictionary_source;
 pub mod dict_entry;
 pub mod query_log;

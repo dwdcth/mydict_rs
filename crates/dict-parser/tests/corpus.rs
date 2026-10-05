@@ -445,3 +445,65 @@ fn parse_parallel_matches_serial() {
     p.sort();
     assert_eq!(s, p, "并行解析输出应与串行完全一致");
 }
+
+#[test]
+fn multi_mdx_group_parses_all_files() {
+    // 手工上传多部 .mdx 成一组：Python 侧遍历全部 .mdx，Rust 侧全局序号按文件拼接
+    let rich = corpus("mdx_v2_rich").join("rich.mdx");
+    let basic = corpus("mdx_v2_basic").join("basic.mdx");
+    if !rich.is_file() || !basic.is_file() {
+        return;
+    }
+    let files = vec![rich, basic];
+
+    // 全量：条目数 = 两部之和
+    let mut entries = Vec::new();
+    let mut parser = dict_parser::mdict::MdictParser::new();
+    parser
+        .parse(&files, &dict_parser::ParseOpts::new(3), &mut |batch| {
+            entries.extend(batch);
+            Ok(())
+        })
+        .expect("multi-mdx parse");
+    let mut single = Vec::new();
+    let mut p1 = dict_parser::mdict::MdictParser::new();
+    p1.parse(&files[..1], &dict_parser::ParseOpts::new(3), &mut |batch| {
+        single.extend(batch);
+        Ok(())
+    })
+    .expect("single parse");
+    let mut other = Vec::new();
+    let mut p2 = dict_parser::mdict::MdictParser::new();
+    p2.parse(&files[1..], &dict_parser::ParseOpts::new(3), &mut |batch| {
+        other.extend(batch);
+        Ok(())
+    })
+    .expect("second parse");
+    assert_eq!(
+        entries.len(),
+        single.len() + other.len(),
+        "多 .mdx 组应导入全部文件（此前只导第一部）"
+    );
+
+    // lite：词头序号跨文件连续
+    let mut headwords = Vec::new();
+    let mut hp = dict_parser::mdict::MdictParser::new();
+    hp.parse_headwords(&files, &mut |batch| {
+        headwords.extend(batch);
+        Ok(())
+    })
+    .expect("headwords");
+    assert_eq!(headwords.len(), entries.len());
+    for (i, hw) in headwords.iter().enumerate() {
+        assert_eq!(hw.ordinal, i as i64, "全局序号应连续");
+    }
+
+    // 物化：第二部文件里的条目按全局序号也能读到
+    let second_file_first = single.len() as i64;
+    let def = hp
+        .definition_at(&files, second_file_first, None)
+        .expect("第二部首条物化");
+    assert!(!def.is_empty());
+    // 越界
+    assert!(hp.definition_at(&files, headwords.len() as i64, None).is_err());
+}

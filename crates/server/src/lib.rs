@@ -84,6 +84,7 @@ pub fn configure_app(cfg: &mut actix_web::web::ServiceConfig, state: Arc<AppStat
                 .configure(api::v1::query::configure)
                 .configure(api::v1::vocab::configure)
                 .configure(api::web::dict::configure)
+                .configure(api::web::groups::configure)
                 .configure(api::web::online::configure)
                 .configure(api::web::random_pick::configure)
                 .configure(api::web::vocab::configure)

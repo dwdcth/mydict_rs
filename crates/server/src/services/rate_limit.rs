@@ -83,7 +83,7 @@ pub async fn check_and_increment_token_daily(
             .await?;
         let retry = timeutil::seconds_to_local_midnight(zone);
         return Err(AppError::rate_limited(
-            format!("今日查询量已达上限（{limit} 次），明天再来吧"),
+            "已超出今日调用次数上限".to_string(),
             retry,
         ));
     }

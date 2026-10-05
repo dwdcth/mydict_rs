@@ -36,7 +36,7 @@ pub async fn top_words(
 ) -> Result<web::Json<Vec<Value>>, AppError> {
     require_admin(&req, &app).await?;
     Ok(web::Json(
-        stats_service::top_words(&app, query.start_date.as_deref(), query.end_date.as_deref(), query.limit.clamp(1, 50)).await?,
+        stats_service::top_words(&app, query.start_date.as_deref(), query.end_date.as_deref(), query.limit.min(50)).await?,
     ))
 }
 

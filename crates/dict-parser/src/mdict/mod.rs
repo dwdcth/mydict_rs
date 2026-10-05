@@ -35,14 +35,36 @@ pub struct MdictParser {
 }
 
 struct Opened {
+    /// 组里的全部 .mdx（常见 1 部；手工上传多部时按文件顺序拼接，
+    /// base = 该文件首条的全局序号）
+    files: Vec<OpenedFile>,
+}
+
+struct OpenedFile {
     backend: Backend,
     sheet: HashMap<String, (String, String)>,
     compact: bool,
+    base: u64,
+    len: u64,
+}
+
+impl Opened {
+    fn total(&self) -> u64 {
+        self.files.last().map(|f| f.base + f.len).unwrap_or(0)
+    }
+
+    /// 全局序号 → (所在文件, 文件内序号)
+    fn locate(&self, ordinal: u64) -> Option<(&OpenedFile, u64)> {
+        self.files
+            .iter()
+            .find(|f| ordinal >= f.base && ordinal < f.base + f.len)
+            .map(|f| (f, ordinal - f.base))
+    }
 }
 
 /// 打开 MDX 的完整路由（probe → mdictlib → Unsupported 回退 opendict）。
 /// 提取为关联函数：并行解析的每个 worker 要各自打开独立句柄。
-fn open_backend(mdx_path: &PathBuf) -> Result<Opened> {
+fn open_backend(mdx_path: &PathBuf) -> Result<OpenedFile> {
     match probe_family(mdx_path) {
         Some(MdictFamily::Opendict) => MdictParser::open_opendict(mdx_path),
         Some(MdictFamily::Mdictlib) | None => match MdictParser::open_mdictlib(mdx_path) {
@@ -93,30 +115,55 @@ impl MdictParser {
         if self.opened.is_some() {
             return Ok(self.opened.as_mut().expect("checked"));
         }
-        let mdx_path = mdx_paths
-            .first()
-            .ok_or_else(|| ParserError::Validation("MDict 词典缺少 .mdx 文件".into()))?;
-
-        let opened = open_backend(mdx_path)?;
-        self.opened = Some(opened);
+        if mdx_paths.is_empty() {
+            return Err(ParserError::Validation("MDict 词典缺少 .mdx 文件".into()));
+        }
+        // 多 .mdx 组：全部打开，全局序号按文件顺序拼接（lite 的 source_ordinal
+        // 依此寻址，definition_at 用 locate 还原到具体文件）
+        let mut files = Vec::with_capacity(mdx_paths.len());
+        let mut base = 0u64;
+        for mdx_path in mdx_paths {
+            let mut opened_file = open_backend(mdx_path)?;
+            opened_file.len = match &opened_file.backend {
+                Backend::Mdictlib { mdx, .. } => mdx.len(),
+                Backend::Opendict { dict } => dict.entry_count() as u64,
+            };
+            opened_file.base = base;
+            base += opened_file.len;
+            files.push(opened_file);
+        }
+        self.opened = Some(Opened { files });
         Ok(self.opened.as_mut().expect("just set"))
     }
 
-    fn open_mdictlib(mdx_path: &PathBuf) -> Result<Opened> {
+    fn open_mdictlib(mdx_path: &PathBuf) -> Result<OpenedFile> {
         let options = mdictlib::OpenOptions::default().with_limits(large_limits());
         let mdx = MdxFile::open_with_options(mdx_path, &options)
             .map_err(map_mdictlib_err(mdx_path))?;
         let header = mdx.header();
-        let sheet = parse_stylesheet(header.attribute("StyleSheet"));
-        let compact = is_compact_value(header.attribute("Compact"));
-        Ok(Opened {
+        // 键大小写不规范的老词典按不区分大小写兜底（对齐 Python is_compact）
+        let attr_ci = |name: &str| -> Option<&str> {
+            header
+                .attribute(name)
+                .or_else(|| {
+                    header
+                        .attributes()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v)
+                })
+        };
+        let sheet = parse_stylesheet(attr_ci("StyleSheet").map(|v| v.to_string()).as_deref());
+        let compact = is_compact_value(attr_ci("Compact"));
+        Ok(OpenedFile {
             backend: Backend::Mdictlib { mdx },
             sheet,
             compact,
+            base: 0,
+            len: 0,
         })
     }
 
-    fn open_opendict(mdx_path: &PathBuf) -> Result<Opened> {
+    fn open_opendict(mdx_path: &PathBuf) -> Result<OpenedFile> {
         let dir = mdx_path
             .parent()
             .ok_or_else(|| ParserError::Validation("MDX 路径没有父目录".into()))?;
@@ -125,10 +172,12 @@ impl MdictParser {
         let header = dict.header();
         let sheet = parse_stylesheet(header.style_sheet.as_deref());
         let compact = header.compact;
-        Ok(Opened {
+        Ok(OpenedFile {
             backend: Backend::Opendict { dict },
             sheet,
             compact,
+            base: 0,
+            len: 0,
         })
     }
 
@@ -140,28 +189,24 @@ impl MdictParser {
         mut sink: impl FnMut(ParsedEntry) -> Result<Flow>,
     ) -> Result<()> {
         let (mdx_paths, _mdd_paths) = Self::split_files(files);
-        let (sheet, compact) = {
-            let opened = self.ensure_opened(&mdx_paths)?;
-            (opened.sheet.clone(), opened.compact)
-        };
-        // 后端按序号位置访问统一迭代（mdictlib 单槽块缓存对顺序访问友好；
-        // opendict 的 keywords 物化 + record_at 位置读）
-        let total = match &self.opened.as_ref().expect("opened").backend {
-            Backend::Mdictlib { mdx, .. } => mdx.len(),
-            Backend::Opendict { dict } => dict.entry_count() as u64,
-        };
-        for ordinal in 0..total {
-            let (word, text) = entry_text_at(self.opened.as_ref().expect("opened"), ordinal)?;
-            // 先展开 `N` 样式标记、再改写资源引用：样式表的标签里本身可能含 src/href
-            let mut definition = expand_style_markers(&text, &sheet, compact);
-            if let Some(opts) = rewrite_opts {
-                if opts.rewrite_refs {
-                    definition = res::rewrite_resource_refs(&definition, opts.dictionary_id);
+        self.ensure_opened(&mdx_paths)?;
+        let opened = self.opened.as_ref().expect("opened");
+        // 逐文件、文件内按序号位置迭代（mdictlib 单槽块缓存对顺序访问友好）；
+        // 样式表/Compact 用**该文件自己**的头部
+        for file in &opened.files {
+            for local in 0..file.len {
+                let (word, text) = entry_text_at(file, local)?;
+                // 先展开 `N` 样式标记、再改写资源引用：样式表的标签里本身可能含 src/href
+                let mut definition = expand_style_markers(&text, &file.sheet, file.compact);
+                if let Some(opts) = rewrite_opts {
+                    if opts.rewrite_refs {
+                        definition = res::rewrite_resource_refs(&definition, opts.dictionary_id);
+                    }
                 }
-            }
-            match sink(ParsedEntry::new(word, definition))? {
-                Flow::Continue => {}
-                Flow::Stop => return Ok(()),
+                match sink(ParsedEntry::new(word, definition))? {
+                    Flow::Continue => {}
+                    Flow::Stop => return Ok(()),
+                }
             }
         }
         Ok(())
@@ -176,24 +221,14 @@ impl MdictParser {
         rewrite_with: Option<i32>,
     ) -> Result<String> {
         let (mdx_paths, _) = Self::split_files(files);
-        let (sheet, compact) = {
-            let opened = self.ensure_opened(&mdx_paths)?;
-            (opened.sheet.clone(), opened.compact)
-        };
-        let text = match &self.opened.as_ref().expect("opened").backend {
-            Backend::Mdictlib { mdx, .. } => mdx
-                .entry_at(mdictlib::KeyOrdinal::from(ordinal as u64))
-                .map_err(|e| ParserError::Internal(format!("读取词条失败: {e}")))?
-                .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?
-                .text()
-                .to_string(),
-            Backend::Opendict { dict } => {
-                dict.entry_at(ordinal as usize)?
-                    .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?
-                    .1
-            }
-        };
-        let mut definition = expand_style_markers(&text, &sheet, compact);
+        self.ensure_opened(&mdx_paths)?;
+        let opened = self.opened.as_ref().expect("opened");
+        let (file, local) = opened
+            .locate(ordinal as u64)
+            .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?;
+        let (word, text) = entry_text_at(file, local)?;
+        let _ = word;
+        let mut definition = expand_style_markers(&text, &file.sheet, file.compact);
         if let Some(dictionary_id) = rewrite_with {
             definition = res::rewrite_resource_refs(&definition, dictionary_id);
         }
@@ -208,47 +243,46 @@ impl MdictParser {
     ) -> Result<()> {
         let (mdx_paths, _) = Self::split_files(files);
         self.ensure_opened(&mdx_paths)?;
-        let total = match &self.opened.as_ref().expect("opened").backend {
-            Backend::Mdictlib { mdx, .. } => mdx.len(),
-            Backend::Opendict { dict } => dict.entry_count() as u64,
-        };
-        for ordinal in 0..total {
-            let word = match &self.opened.as_ref().expect("opened").backend {
-                Backend::Mdictlib { mdx, .. } => {
-                    let Some(key) = mdx
-                        .key_at(mdictlib::KeyOrdinal::from(ordinal))
-                        .map_err(|e| ParserError::Internal(format!("读词头失败: {e}")))?
-                    else {
-                        continue;
-                    };
-                    key.key().to_string()
-                }
-                Backend::Opendict { dict } => match dict.word_at(ordinal as usize) {
-                    Some(word) => word.to_string(),
-                    None => continue,
-                },
-            };
-            sink(Headword {
-                word,
-                ordinal: ordinal as i64,
-            })?;
+        let opened = self.opened.as_ref().expect("opened");
+        for file in &opened.files {
+            for local in 0..file.len {
+                let word = match &file.backend {
+                    Backend::Mdictlib { mdx, .. } => {
+                        let Some(key) = mdx
+                            .key_at(mdictlib::KeyOrdinal::from(local))
+                            .map_err(|e| ParserError::Internal(format!("读词头失败: {e}")))?
+                        else {
+                            continue;
+                        };
+                        key.key().to_string()
+                    }
+                    Backend::Opendict { dict } => match dict.word_at(local as usize) {
+                        Some(word) => word.to_string(),
+                        None => continue,
+                    },
+                };
+                sink(Headword {
+                    word,
+                    ordinal: (file.base + local) as i64,
+                })?;
+            }
         }
         Ok(())
     }
 }
 
-/// 在已打开的句柄上按序号读一条 (word, 原始释义文本)
-fn entry_text_at(opened: &Opened, ordinal: u64) -> Result<(String, String)> {
-    match &opened.backend {
+/// 在已打开的文件句柄上按**文件内**序号读一条 (word, 原始释义文本)
+fn entry_text_at(file: &OpenedFile, local: u64) -> Result<(String, String)> {
+    match &file.backend {
         Backend::Mdictlib { mdx, .. } => {
             let entry = mdx
-                .entry_at(mdictlib::KeyOrdinal::from(ordinal))
+                .entry_at(mdictlib::KeyOrdinal::from(local))
                 .map_err(|e| ParserError::Internal(format!("读取词条失败: {e}")))?
                 .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?;
             Ok((entry.key().to_string(), entry.text().to_string()))
         }
         Backend::Opendict { dict } => Ok(dict
-            .entry_at(ordinal as usize)?
+            .entry_at(local as usize)?
             .ok_or_else(|| ParserError::Internal("词条序号越界".into()))?),
     }
 }
@@ -339,11 +373,9 @@ impl super::DictionaryParser for MdictParser {
         if mdx_paths.is_empty() {
             return Err(ParserError::Validation("MDict 词典缺少 .mdx 文件".into()));
         }
-        let opened = self.ensure_opened(&mdx_paths)?;
-        let total = match &opened.backend {
-            Backend::Mdictlib { mdx, .. } => mdx.len(),
-            Backend::Opendict { dict } => dict.entry_count() as u64,
-        } as usize;
+        self.ensure_opened(&mdx_paths)?;
+        let opened = self.opened.as_ref().expect("opened");
+        let total = opened.total() as usize;
 
         // 跨度按 2 倍目标取（词头里难免混着索引项），并且跑完整段再统一下采样
         // ——中途收满就停会退回「只取开头」
@@ -351,10 +383,14 @@ impl super::DictionaryParser for MdictParser {
         let mut collected: Vec<String> = Vec::new();
         let mut index = 0usize;
         while index < total {
-            let word = match &self.opened.as_ref().expect("opened").backend {
+            let Some((file, local)) = opened.locate(index as u64) else {
+                index += step;
+                continue;
+            };
+            let word = match &file.backend {
                 Backend::Mdictlib { mdx, .. } => {
                     let Some(key) = mdx
-                        .key_at(mdictlib::KeyOrdinal::from(index as u64))
+                        .key_at(mdictlib::KeyOrdinal::from(local))
                         .map_err(|e| ParserError::Internal(format!("读词头失败: {e}")))?
                     else {
                         index += step;
@@ -363,7 +399,7 @@ impl super::DictionaryParser for MdictParser {
                     key.key().to_string()
                 }
                 Backend::Opendict { dict } => {
-                    match dict.entry_at(index)? {
+                    match dict.entry_at(local as usize)? {
                         Some((word, _)) => word,
                         None => {
                             index += step;
@@ -424,20 +460,18 @@ impl super::DictionaryParser for MdictParser {
 
         // 探路一次拿总条数（worker 各自再打开独立句柄）
         self.ensure_opened(&mdx_paths)?;
-        let total = match &self.opened.as_ref().expect("opened").backend {
-            Backend::Mdictlib { mdx, .. } => mdx.len(),
-            Backend::Opendict { dict } => dict.entry_count() as u64,
-        } as usize;
+        let total = self.opened.as_ref().expect("opened").total() as usize;
         if total == 0 {
             return Ok(());
         }
+        // 多 .mdx 组：worker 也要打开全部文件并复刻 base 偏移，才能按全局区间寻址
+        let all_mdx: Vec<PathBuf> = mdx_paths.iter().map(|p| (*p).clone()).collect();
         // CPU 占用控制：worker 数封顶（导入任务本身经 bulk_write 串行排队，
         // 多词典同时转换也不会叠加并行度）；sync_channel(2) 提供批间背压
         let workers = workers.clamp(1, 16).min(total);
         let chunk = total.div_ceil(workers);
         let rewrite = opts.rewrite_refs;
         let dictionary_id = opts.dictionary_id;
-        let mdx_path = (*mdx_paths[0]).clone();
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<ParsedEntry>>(2);
         let mut first_error: Option<ParserError> = None;
@@ -450,14 +484,32 @@ impl super::DictionaryParser for MdictParser {
                     break;
                 }
                 let tx = tx.clone();
-                let path = mdx_path.clone();
+                let paths = all_mdx.clone();
                 handles.push(scope.spawn(move || -> Result<()> {
-                    let opened = open_backend(&path)?;
+                    // 打开全部 .mdx 并复刻 base 偏移（与主线程 ensure_opened 同一算法）
+                    let mut files = Vec::with_capacity(paths.len());
+                    let mut base = 0u64;
+                    for path in &paths {
+                        let mut file = open_backend(path)?;
+                        file.len = match &file.backend {
+                            Backend::Mdictlib { mdx, .. } => mdx.len(),
+                            Backend::Opendict { dict } => dict.entry_count() as u64,
+                        };
+                        file.base = base;
+                        base += file.len;
+                        files.push(file);
+                    }
                     let mut batch: Vec<ParsedEntry> = Vec::with_capacity(2000);
                     for ordinal in lo as u64..hi as u64 {
-                        let (word, text) = entry_text_at(&opened, ordinal)?;
+                        let Some((file, local)) =
+                            files.iter().find(|f| ordinal >= f.base && ordinal < f.base + f.len)
+                                .map(|f| (f, ordinal - f.base))
+                        else {
+                            continue;
+                        };
+                        let (word, text) = entry_text_at(file, local)?;
                         let mut definition =
-                            expand_style_markers(&text, &opened.sheet, opened.compact);
+                            expand_style_markers(&text, &file.sheet, file.compact);
                         if rewrite {
                             definition = res::rewrite_resource_refs(&definition, dictionary_id);
                         }
@@ -517,18 +569,32 @@ impl MdictParser {
         }
         let (mdx_paths, _) = Self::split_files(files);
         let use_opendict = matches!(
-            self.ensure_opened(&mdx_paths)?.backend,
-            Backend::Opendict { .. }
+            self.ensure_opened(&mdx_paths)?.files.first().map(|f| &f.backend),
+            Some(Backend::Opendict { .. })
         );
         if use_opendict {
             // v3：fork 补丁的枚举接口
-            let keys: Vec<String> = match &self.opened.as_ref().expect("opened").backend {
-                Backend::Opendict { dict } => dict.mdd_resource_keys(),
+            let keys: Vec<String> = match &self
+                .opened
+                .as_ref()
+                .expect("opened")
+                .files
+                .first()
+                .map(|f| &f.backend)
+            {
+                Some(Backend::Opendict { dict }) => dict.mdd_resource_keys(),
                 _ => unreachable!(),
             };
             for key in keys {
-                let content = match &self.opened.as_ref().expect("opened").backend {
-                    Backend::Opendict { dict } => dict.lookup_resource(&key),
+                let content = match &self
+                    .opened
+                    .as_ref()
+                    .expect("opened")
+                    .files
+                    .first()
+                    .map(|f| &f.backend)
+                {
+                    Some(Backend::Opendict { dict }) => dict.lookup_resource(&key),
                     _ => unreachable!(),
                 };
                 if let Some(content) = content {
