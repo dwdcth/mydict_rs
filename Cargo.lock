@@ -4009,6 +4009,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "typenum",
  "unicode-normalization",
  "uuid",
  "walkdir",

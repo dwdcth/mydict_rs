@@ -5,7 +5,7 @@
 //! DB 文件单独泄露时不可直接复用。普通 Token 仍只存哈希。
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ pub fn seal_token(plain: &str, secret: &str) -> Vec<u8> {
     };
     let sealed = cipher
         .encrypt(
-            *Nonce::from_slice(&nonce_bytes),
+            &aes_gcm::Nonce::<typenum::U12>::try_from(nonce_bytes.as_slice()).expect("12B"),
             Payload {
                 msg: plain.as_bytes(),
                 aad: b"mydict-token",
@@ -56,7 +56,7 @@ pub fn unseal_token(secret_data: &[u8], secret: &str) -> Option<String> {
     let (nonce_bytes, ct) = secret_data.split_at(12);
     let plain = cipher
         .decrypt(
-            *Nonce::from_slice(nonce_bytes),
+            &aes_gcm::Nonce::<typenum::U12>::try_from(nonce_bytes).expect("12B"),
             Payload {
                 msg: ct,
                 aad: b"mydict-token",
