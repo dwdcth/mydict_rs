@@ -541,7 +541,7 @@ fn extract_one_zip(zip_path: &Path, max_bytes: i64) -> Result<usize, AppError> {
         if file_size + written > max_bytes {
             let _ = std::fs::remove_file(&dest);
             return Err(AppError::validation(format!(
-                "压缩包解压后超过 {}MB 上限",
+                "压缩包解压后超过 {}MB 上限（UPLOAD_UNPACK_LIMIT_MB 可调）",
                 max_bytes / 1024 / 1024
             )));
         }
@@ -559,7 +559,7 @@ pub async fn analyze_upload_staging(
     if !root.is_dir() {
         return Err(AppError::not_found("上传内容不存在或已过期"));
     }
-    let max_bytes = state.cfg.max_upload_size_mb * 1024 * 1024;
+    let max_bytes = state.cfg.upload_unpack_limit_mb * 1024 * 1024;
     let root2 = root.clone();
     tokio::task::spawn_blocking(move || extract_archives(&root2, max_bytes))
         .await

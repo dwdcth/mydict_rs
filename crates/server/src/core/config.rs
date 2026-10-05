@@ -15,6 +15,9 @@ pub struct Settings {
     pub anonymous_ip_rate_limit_per_min: i64,
     pub user_ip_rate_limit_per_min: i64,
     pub max_upload_size_mb: i64,
+    /// zip 上传解压后的总容量上限（压缩包解开后常远超上传体积，与 MAX_UPLOAD_SIZE_MB
+    /// 独立；默认 8GB——真实词库的 .mdd 动辄数 GB）
+    pub upload_unpack_limit_mb: i64,
     /// 全量解析（导入/lite→full 转换）的并行 worker 数。
     /// 0 = 自动：核数一半、封顶 4（CPU 留余量，导入任务又经 bulk_write 串行排队）
     pub import_workers: usize,
@@ -122,6 +125,7 @@ impl Settings {
             user_ip_rate_limit_per_min: env_i64("USER_IP_RATE_LIMIT_PER_MIN", 120),
             max_upload_size_mb: env_i64("MAX_UPLOAD_SIZE_MB", 512),
             import_workers: env_usize("IMPORT_WORKERS", 0),
+            upload_unpack_limit_mb: env_i64("UPLOAD_UNPACK_LIMIT_MB", 8 * 1024),
             enable_scheduler: env_bool("ENABLE_SCHEDULER", true),
             timezone: env_str("TIMEZONE", ""),
             version_file_path: env_str("VERSION_FILE_PATH", "/version.txt"),
