@@ -134,11 +134,32 @@ export function prefetchEntryHtml(dictionaryId: number, word: string, entryIds?:
  * 刻意渲染快照而不是按词典实时取：生词本存的就是收藏当时那份释义，词典后来被删或改
  * 都不该影响它。
  */
+// 复习页翻面高频取同一批快照：LRU 24 份（失败的请求出缓存，可重试）
+const VOCAB_HTML_CACHE = new Map<number, Promise<string>>()
+const VOCAB_HTML_CACHE_MAX = 24
+
 export function getVocabEntryHtml(itemId: number) {
-  return request.get<never, string>(`/vocab/${itemId}/entry`, {
-    params: { theme: currentTheme() },
-    responseType: 'text',
-  })
+  const cached = VOCAB_HTML_CACHE.get(itemId)
+  if (cached) {
+    VOCAB_HTML_CACHE.delete(itemId)
+    VOCAB_HTML_CACHE.set(itemId, cached)
+    return cached
+  }
+  const pending = request
+    .get<never, string>(`/vocab/${itemId}/entry`, {
+      params: { theme: currentTheme() },
+      responseType: 'text',
+    })
+    .catch((err) => {
+      VOCAB_HTML_CACHE.delete(itemId)
+      throw err
+    })
+  VOCAB_HTML_CACHE.set(itemId, pending)
+  if (VOCAB_HTML_CACHE.size > VOCAB_HTML_CACHE_MAX) {
+    const oldest = VOCAB_HTML_CACHE.keys().next().value
+    if (oldest !== undefined) VOCAB_HTML_CACHE.delete(oldest)
+  }
+  return pending
 }
 
 export function getQueryHistory() {

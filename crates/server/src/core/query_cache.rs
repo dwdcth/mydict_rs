@@ -15,6 +15,9 @@ pub const EXPANSION_VERSION: i32 = 2;
 
 pub struct QueryCache {
     inner: MokaCache<String, Arc<Value>>,
+    /// 词条文档 HTML 的短 TTL 缓存（图片版词典一份文档 35KB+，渲染含物化与
+    /// mdd 资产探测；120s 过期，invalidate() 连带清空）
+    docs: MokaCache<String, Arc<String>>,
 }
 
 impl QueryCache {
@@ -24,7 +27,19 @@ impl QueryCache {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
+            docs: MokaCache::builder()
+                .max_capacity(256)
+                .time_to_live(Duration::from_secs(120))
+                .build(),
         }
+    }
+
+    pub fn get_doc(&self, key: &str) -> Option<Arc<String>> {
+        self.docs.get(key)
+    }
+
+    pub fn insert_doc(&self, key: String, body: Arc<String>) {
+        self.docs.insert(key, body);
     }
 
     pub fn make_key(
@@ -56,6 +71,7 @@ impl QueryCache {
 
     /// 全量失效（对齐 Python invalidate()）
     pub fn invalidate(&self) {
+        self.docs.invalidate_all();
         self.inner.invalidate_all();
     }
 }

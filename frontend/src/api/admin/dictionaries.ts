@@ -24,10 +24,18 @@ export function uploadDictionary(form: FormData) {
 }
 
 // 上传文件/文件夹/压缩包：服务器解压分组（不导入），返回识别出的词典组
-export function analyzeUpload(form: FormData) {
+export function analyzeUpload(
+  form: FormData,
+  onUploadProgress?: (percent: number) => void,
+) {
   return request.post<never, UploadedAnalysis>('/admin/dictionaries/analyze-upload', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 0,
+    onUploadProgress: (event) => {
+      if (onUploadProgress && event.total) {
+        onUploadProgress(Math.round((event.loaded / event.total) * 100))
+      }
+    },
   })
 }
 

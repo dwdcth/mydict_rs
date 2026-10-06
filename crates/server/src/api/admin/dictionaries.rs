@@ -444,6 +444,8 @@ pub async fn entry_document(
         false, // 管理端预览：不开选中查词
         &extra_assets,
     );
+    app.query_cache
+        .insert_doc(format!("admin|{dictionary_id}|{word}"), std::sync::Arc::new(doc.clone()));
     Ok(actix_web::HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(doc))

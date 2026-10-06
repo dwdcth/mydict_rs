@@ -159,3 +159,30 @@ pub async fn materialize_definition(
     state.definition_resources.defs.insert(key, arc.clone());
     Some(arc)
 }
+
+/// 预热：打开词典源文件并把句柄放进缓存（bootstrap/启用后调用，
+/// 消掉重启后第一次查询的冷启动——大词典词头索引加载要几秒）
+pub async fn warm_dictionary(state: &AppState, dictionary_id: i32) {
+    let _ = materialize_definition(state, dictionary_id, 0).await;
+}
+
+/// 后台预热全部启用的 lite 词典（顺序执行，避免同时打开多个大文件把 IO 打满）
+pub async fn warm_enabled_lite_dictionaries(state: &AppState) {
+    use sea_orm::ConnectionTrait;
+    let Ok(rows) = state
+        .db
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            state.db.get_database_backend(),
+            "SELECT id FROM dictionaries WHERE status = 'enabled' AND entry_mode = 'lite' \
+             AND format IN ('mdict', 'stardict')",
+            [],
+        ))
+        .await
+    else {
+        return;
+    };
+    for row in rows {
+        let id: i32 = row.try_get("", "id").unwrap_or_default();
+        warm_dictionary(state, id).await;
+    }
+}

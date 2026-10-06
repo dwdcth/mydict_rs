@@ -27,6 +27,12 @@ function toggle() {
     <div class="card-header" @click="toggle">
       <div class="title">
         <span class="word" :title="item.word">{{ item.word }}</span>
+        <span
+          v-if="item.in_review"
+          class="review-tag"
+          title="已加入 FSRS 间隔复习（查询页点卡片图标可移出）"
+          >复习中</span
+        >
         <span v-if="item.dictionary_name" class="dict-name" :title="item.dictionary_name">
           {{ item.dictionary_name }}
         </span>
@@ -94,6 +100,16 @@ function toggle() {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+.review-tag {
+  flex-shrink: 0;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-hover-tint);
+  color: var(--color-brand-500);
+  font-size: var(--text-xs);
+  line-height: 18px;
 }
 
 .word {

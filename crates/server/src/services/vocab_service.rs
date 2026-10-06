@@ -191,6 +191,7 @@ fn vocab_row_to_json(row: &sea_orm::QueryResult) -> Value {
         "dictionary_id": row.try_get::<Option<i32>>("", "dictionary_id").ok().flatten(),
         "dictionary_name": row.try_get::<Option<String>>("", "dictionary_name").ok().flatten(),
         "created_at": unix_to_iso(row.try_get::<i64>("", "created_at").unwrap_or_default()),
+        "in_review": row.try_get::<Option<i32>>("", "in_review").ok().flatten().map(|v| v != 0).unwrap_or(false),
     })
 }
 
@@ -250,7 +251,8 @@ pub async fn list_vocab_items(
         .query_all_raw(Statement::from_sql_and_values(
             backend,
             format!(
-                "SELECT v.* FROM {} v WHERE {where_sql} ORDER BY {sort_col} {dir}, v.id {dir} LIMIT {} OFFSET {}",
+                "SELECT v.*, EXISTS(SELECT 1 FROM flashcards f WHERE f.vocab_item_id = v.id) AS in_review \
+                 FROM {} v WHERE {where_sql} ORDER BY {sort_col} {dir}, v.id {dir} LIMIT {} OFFSET {}",
                 kind.table(),
                 params.page_size,
                 (params.page - 1).max(0) * params.page_size

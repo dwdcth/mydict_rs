@@ -20,6 +20,8 @@ const props = defineProps<{
   mounted: boolean
   favoritedWords: Set<string>
   favoriteLoading: Set<string>
+  flashcardWords: Set<string>
+  flashcardLoading: Set<string>
 }>()
 
 const emit = defineEmits<{
@@ -181,7 +183,8 @@ function isLoading(word: string, dictionaryId: number) {
           @toggle="emit('toggleFavorite', primary.word, primary.dictionary_id)"
         />
         <FlashcardButton
-          :active="false"
+          :active="flashcardWords.has(`${primary.word.trim().toLowerCase()}|${primary.dictionary_id}`)"
+          :loading="flashcardLoading.has(`${primary.word.trim().toLowerCase()}|${primary.dictionary_id}`)"
           @add="emit('addFlashcard', primary.word, primary.dictionary_id)"
         />
       </span>

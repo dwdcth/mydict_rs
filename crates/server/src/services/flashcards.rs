@@ -223,6 +223,20 @@ pub async fn review_queue(
                 .model
                 .next_states(memory_of(row), fsrs.retention, elapsed_days_of(row))
                 .map_err(|e| AppError::internal("fsrs", e))?;
+            // 当前记忆率（复习前的可提取性；新卡无历史 → null）
+            let memory = memory_of(row);
+            let retrievability: Value = match memory {
+                Some(m) => json!(fsrs::current_retrievability(
+                    m,
+                    elapsed_days_of(row) as f32,
+                    fsrs::FSRS6_DEFAULT_DECAY,
+                )),
+                None => Value::Null,
+            };
+            let days_since: Value = match row.try_get::<i64>("", "last_review").unwrap_or_default() {
+                0 => Value::Null,
+                last => json!((now.timestamp() - last).max(0) / 86400),
+            };
             let preview = |item: &fsrs::ItemState| -> Value {
                 let days = interval_days(item.interval);
                 json!({
@@ -240,6 +254,8 @@ pub async fn review_queue(
                 "state": row.try_get::<i64>("", "state").unwrap_or_default(),
                 "reps": row.try_get::<i32>("", "reps").unwrap_or_default(),
                 "lapses": row.try_get::<i32>("", "lapses").unwrap_or_default(),
+                "retrievability": retrievability,
+                "days_since_last_review": days_since,
                 "previews": {
                     "again": preview(&states.again),
                     "hard": preview(&states.hard),
@@ -374,7 +390,7 @@ pub async fn list_cards(
         .query_all_raw(Statement::from_sql_and_values(
             backend,
             format!(
-                "SELECT f.*, v.word, v.phonetic, d.name AS dictionary_name \
+                "SELECT f.*, v.word, v.phonetic, v.dictionary_id, d.name AS dictionary_name \
                  FROM flashcards f \
                  JOIN vocab_items v ON v.id = f.vocab_item_id \
                  LEFT JOIN dictionaries d ON d.id = v.dictionary_id \
@@ -393,6 +409,7 @@ pub async fn list_cards(
                 "vocab_item_id": row.try_get::<i32>("", "vocab_item_id").unwrap_or_default(),
                 "word": row.try_get::<String>("", "word").unwrap_or_default(),
                 "phonetic": row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
+                "dictionary_id": row.try_get::<Option<i32>>("", "dictionary_id").ok().flatten(),
                 "dictionary_name": row.try_get::<Option<String>>("", "dictionary_name").ok().flatten(),
                 "state": row.try_get::<i64>("", "state").unwrap_or_default(),
                 "due_at": row.try_get::<i64>("", "due").unwrap_or_default(),

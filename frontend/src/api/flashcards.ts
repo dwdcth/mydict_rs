@@ -16,6 +16,9 @@ export interface FlashcardQueueItem {
   state: number
   reps: number
   lapses: number
+  /** 复习前的当前记忆率（0-1；新卡为 null） */
+  retrievability: number | null
+  days_since_last_review: number | null
   /** 四档评分的预测间隔（按钮上直接展示） */
   previews: Record<'again' | 'hard' | 'good' | 'easy', { interval_days: number; label: string } | null>
 }
@@ -67,6 +70,7 @@ export function listFlashcards(filter: 'due' | 'all' = 'all', page = 1, pageSize
       vocab_item_id: number
       word: string
       phonetic: string | null
+      dictionary_id: number | null
       dictionary_name: string | null
       state: number
       due_at: number

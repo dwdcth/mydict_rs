@@ -27,6 +27,8 @@ const FORMAT_LABELS: Record<DictionaryFormat, string> = {
 const { waitForImportTask, isUnmounted } = useImportTask()
 
 const analyzing = ref(false)
+/** 上传进度（0-100；到 99 后是服务器解压/识别，100=完成） */
+const uploadPercent = ref(0)
 const uploadId = ref('')
 const groups = ref<DictsDirGroup[]>([])
 const skipped = ref<string[]>([])
@@ -122,6 +124,7 @@ async function walkEntry(entry: FileSystemEntry, prefix: string, out: { file: Fi
 
 async function analyze(items: { file: File; relPath: string }[]) {
   analyzing.value = true
+  uploadPercent.value = 0
   batchSummary.value = ''
   try {
     const form = new FormData()
@@ -129,7 +132,10 @@ async function analyze(items: { file: File; relPath: string }[]) {
       // 用相对路径当文件名：服务器按目录结构落盘、解压 zip、自动分组
       form.append('files', item.file, item.relPath)
     }
-    const analysis = await dictApi.analyzeUpload(form)
+    const analysis = await dictApi.analyzeUpload(form, (percent) => {
+      // >99% 后进入服务器解压/识别阶段（那时没有上传进度可言）
+      uploadPercent.value = Math.min(percent, 99)
+    })
     uploadId.value = analysis.upload_id
     groups.value = analysis.groups
     skipped.value = analysis.skipped
@@ -146,6 +152,7 @@ async function analyze(items: { file: File; relPath: string }[]) {
     if (analysis.groups.length === 0) {
       ElMessage.warning('没有识别出可导入的词典（支持 .mdx/.mdd、StarDict、ECDICT CSV 与 .zip 打包）')
     }
+    uploadPercent.value = 100
   } finally {
     analyzing.value = false
   }
@@ -278,9 +285,15 @@ defineExpose({ submit, cancel, running: batchRunning, analyzing, reset })
       @dragover.prevent="dragging = true"
       @dragleave="dragging = false"
       @drop.prevent="onDrop"
-      v-loading="analyzing"
-      element-loading-text="正在上传并识别…"
     >
+      <el-progress
+        v-if="analyzing && uploadPercent > 0"
+        :percentage="uploadPercent"
+        :stroke-width="8"
+        :show-text="uploadPercent < 100"
+        class="upload-progress"
+      />
+      <p v-if="analyzing && uploadPercent >= 99" class="hint">服务器解压与识别中…</p>
       <el-icon :size="36"><UploadFilled /></el-icon>
       <p class="drop-title">把词典文件 / 文件夹 / .zip 拖到这里</p>
       <div class="drop-actions">
@@ -393,6 +406,10 @@ defineExpose({ submit, cancel, running: batchRunning, analyzing, reset })
 .drop-zone.dragging {
   border-color: var(--color-brand-500);
   background: var(--color-hover-tint);
+}
+
+.upload-progress {
+  width: min(360px, 80%);
 }
 
 .drop-zone.busy {

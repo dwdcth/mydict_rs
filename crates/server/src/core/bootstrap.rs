@@ -89,6 +89,15 @@ async fn run_inner(app: &std::sync::Arc<AppState>) -> Result<(), sea_orm::DbErr>
     }
     crate::tasks::warmup::warm_random_bounds(app).await;
 
+    // lite 词典的源文件句柄预热（后台、不阻塞 READY）：大词典词头索引加载要几秒，
+    // 不预热的话重启后第一个查词的人要付这笔钱
+    {
+        let app2 = app.clone();
+        tokio::spawn(async move {
+            crate::services::mdx_resources::warm_enabled_lite_dictionaries(&app2).await;
+        });
+    }
+
     app.bootstrap.set(Phase::Ready, None);
     tracing::info!(version = crate::core::version::get_app_version(&app.cfg.version_file_path), "mydict 就绪");
     Ok(())

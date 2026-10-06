@@ -1463,6 +1463,31 @@ async fn flashcards_fsrs_full_flow() {
         assert_eq!(n.try_get::<i64>("", "n").unwrap(), 1);
     }
 
+    // 复习后的卡再进队列（新词 banana 加卡）应带记忆率与复习史
+    let _: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/flashcards")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"word": "banana", "dictionary_id": dict_id}))
+            .to_request(),
+    )
+    .await;
+    let queue: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/queue").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    let banana = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["word"] == "banana")
+        .expect("banana 新卡");
+    assert!(banana["retrievability"].is_null(), "新卡无记忆率：{banana:?}");
+    assert!(banana["days_since_last_review"].is_null());
+    let banana_id = banana["vocab_item_id"].as_i64().unwrap() as i32;
+
     // 参数：retention 0.95、非法权重 422、合法 19 位 OK
     let put: Value = actix_test::call_and_read_body_json(
         &mut svc,
@@ -1509,6 +1534,16 @@ async fn flashcards_fsrs_full_flow() {
     )
     .await;
     assert_eq!(resp["ok"], true);
+    // banana 的卡一并清掉（生词本会留下两条，断言改看总数）
+    let resp: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::delete()
+            .uri(&format!("/api/flashcards/{banana_id}"))
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp["ok"], true);
     let stats: Value = actix_test::call_and_read_body_json(
         &mut svc,
         TestRequest::get().uri("/api/flashcards/stats").pipe_bearer(&token).to_request(),
@@ -1520,5 +1555,11 @@ async fn flashcards_fsrs_full_flow() {
         TestRequest::get().uri("/api/vocab").pipe_bearer(&token).to_request(),
     )
     .await;
-    assert_eq!(vocab["total"], 1, "生词本条目应保留：{vocab:?}");
+    assert_eq!(vocab["total"], 2, "生词本条目应保留：{vocab:?}");
+    // in_review 标记：两条都已移出复习
+    assert!(vocab["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["in_review"] == false));
 }

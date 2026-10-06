@@ -276,6 +276,20 @@ function dueLabel(dueAt: number) {
 
           <!-- 背面：释义快照 + 评分 -->
           <template v-if="revealed">
+            <div v-if="current.reps > 0" class="memory-meta">
+              <template v-if="current.retrievability != null">
+                <span>复习前记忆率 ≈ {{ Math.round((current.retrievability ?? 0) * 100) }}%</span>
+                <span>·</span>
+              </template>
+              <span v-if="current.days_since_last_review != null"
+                >{{ current.days_since_last_review }} 天前复习过</span
+              >
+              <span v-else>首次复习</span>
+              <span>·</span>
+              <span>已复习 {{ current.reps }} 次<template v-if="current.lapses"
+                >（遗忘 {{ current.lapses }} 次）</template
+              ></span>
+            </div>
             <div class="card-back app-scrollbar">
               <EntryFrame :loader="() => getVocabEntryHtml(current!.vocab_item_id)" />
             </div>
@@ -450,6 +464,15 @@ function dueLabel(dueAt: number) {
 
 .reveal-btn:hover {
   background: var(--color-hover-tint);
+}
+
+.memory-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4) 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
 }
 
 .card-back {

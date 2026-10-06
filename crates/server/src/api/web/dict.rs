@@ -215,6 +215,19 @@ pub async fn entry(
         }
     }
 
+    // 短 TTL 文档缓存：图片版词典一份文档 35KB+ 且渲染要物化/mdd 探测；
+    // key 含 entry_ids 与主题（两个主题变体各存各的）
+    let doc_key = format!(
+        "{dictionary_id}|{}|{}|{}",
+        word,
+        entry_ids.as_ref().map(|ids| ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")).unwrap_or_default(),
+        params.theme.as_deref().unwrap_or("")
+    );
+    if let Some(cached) = app.query_cache.get_doc(&doc_key) {
+        return Ok(HttpResponse::Ok()
+            .content_type("text/html; charset=utf-8")
+            .body((*cached).clone()));
+    }
     let render_entries: Vec<entry_render::RenderEntry<'_>> = entries
         .iter()
         .map(|e| entry_render::RenderEntry {
@@ -230,6 +243,8 @@ pub async fn entry(
         true, // 前台查询页：允许选中查词
         &extra_assets,
     );
+    app.query_cache
+        .insert_doc(doc_key, std::sync::Arc::new(doc.clone()));
     Ok(HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(doc))

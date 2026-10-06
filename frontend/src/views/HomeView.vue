@@ -13,7 +13,7 @@ import RandomDictPanel from '../components/RandomDictPanel.vue'
 import SkeletonList from '../components/SkeletonList.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { searchWord } from '../api/dict'
-import { addFlashcard } from '../api/flashcards'
+import { useFlashcards } from '../composables/useFlashcards'
 import { getSystemInfo } from '../api/system'
 import { useUserAuthStore } from '../stores/userAuth'
 import { useSettingsStore } from '../stores/settings'
@@ -28,16 +28,9 @@ const route = useRoute()
 const authStore = useUserAuthStore()
 const settingsStore = useSettingsStore()
 const { favoriteMap, favoriteLoading, loadFavorites, toggleFavorite } = useFavorites()
+const { flashcardMap, flashcardLoading, loadFlashcards, toggleFlashcard } = useFlashcards()
 
-/** 查询面板「加入复习」：词条不在生词本会自动先收藏（后端一个调用完成） */
-async function handleAddFlashcard(word: string, dictionaryId: number) {
-  try {
-    const result = await addFlashcard(word, dictionaryId)
-    ElMessage.success(result.already ? `「${word}」已在复习计划中` : `「${word}」已加入复习`)
-  } catch {
-    // 未登录/限流等由响应拦截器提示
-  }
-}
+
 const {
   dictionaries,
   selectedIds,
@@ -97,6 +90,7 @@ watch(
 )
 
 const favoritedWords = computed(() => new Set(favoriteMap.value.keys()))
+const flashcardReviewWords = computed(() => new Set(flashcardMap.value.keys()))
 
 interface DictionaryGroup {
   key: string
@@ -145,6 +139,7 @@ onMounted(async () => {
   await Promise.all([
     loadFavorites().catch(() => undefined),
     authStore.isLoggedIn ? loadDictionaryFilter() : undefined,
+    loadFlashcards().catch(() => undefined),
   ])
   // 词典列表与登录态都就绪了，这时才处理地址栏里的 ?q=（外链直达）
   await runFromUrl()
@@ -587,9 +582,11 @@ function onRescroll(key: string) {
               :pool-ids="randomPool"
               :favorited-words="favoritedWords"
               :favorite-loading="favoriteLoading"
+              :flashcard-words="flashcardReviewWords"
+              :flashcard-loading="flashcardLoading"
               @entry="searchFromEntry"
               @toggle-favorite="toggleFavorite"
-              @add-flashcard="handleAddFlashcard"
+              @add-flashcard="toggleFlashcard"
               @unsupported-audio="onUnsupportedAudio"
             />
           </template>
@@ -625,11 +622,13 @@ function onRescroll(key: string) {
               :mounted="liveKeys.includes(group.key)"
               :favorited-words="favoritedWords"
               :favorite-loading="favoriteLoading"
+              :flashcard-words="flashcardReviewWords"
+              :flashcard-loading="flashcardLoading"
               @toggle="toggleGroup(group.key)"
               @entry="searchFromEntry"
               @escape="collapseOnEscape()"
               @toggle-favorite="toggleFavorite"
-              @add-flashcard="handleAddFlashcard"
+              @add-flashcard="toggleFlashcard"
               @unsupported-audio="onUnsupportedAudio"
               @rescroll="onRescroll(group.key)"
             />

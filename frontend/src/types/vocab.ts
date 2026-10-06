@@ -8,6 +8,8 @@ export interface VocabItem {
   /** 来源词典名快照（词典被删后仍有值） */
   dictionary_name: string | null
   created_at: string
+  /** 已加入 FSRS 复习计划 */
+  in_review?: boolean
 }
 
 export interface VocabListResponse {
