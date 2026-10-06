@@ -405,6 +405,9 @@ pub struct TtsQuery {
     /// 可选语言提示（词条 lang_from）；缺省按词形自动判
     #[serde(default)]
     pub lang: Option<String>,
+    /// 指定嗓音试听（管理端预览用；缺省按语言用设置里的嗓音）
+    #[serde(default)]
+    pub voice: Option<String>,
 }
 
 /// GET /api/dict/tts —— 词语合成发音（kokoro-micro，WAV）。
@@ -427,7 +430,13 @@ pub async fn word_tts(
         .clone()
         .or_else(|| query.word.clone())
         .unwrap_or_default();
-    let wav = crate::services::tts::synthesize_wav(&app, &text, query.lang.as_deref()).await?;
+    let wav = crate::services::tts::synthesize_wav_with_voice(
+        &app,
+        &text,
+        query.lang.as_deref(),
+        query.voice.as_deref(),
+    )
+    .await?;
     Ok(HttpResponse::Ok()
         .content_type("audio/wav")
         .insert_header((

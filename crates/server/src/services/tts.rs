@@ -95,6 +95,16 @@ pub async fn synthesize_wav(
     word: &str,
     lang_hint: Option<&str>,
 ) -> Result<Arc<Vec<u8>>, AppError> {
+    synthesize_wav_with_voice(state, word, lang_hint, None).await
+}
+
+/// voice_override：试听指定嗓音（None = 按语言自动选设置里的嗓音）
+pub async fn synthesize_wav_with_voice(
+    state: &AppState,
+    word: &str,
+    lang_hint: Option<&str>,
+    voice_override: Option<&str>,
+) -> Result<Arc<Vec<u8>>, AppError> {
     let word = word.trim();
     if word.is_empty() || word.chars().count() > 500 {
         return Err(AppError::validation("文本为空或超过 500 字"));
@@ -105,7 +115,12 @@ pub async fn synthesize_wav(
             "TTS 未启用（管理后台 → 系统设置里开启）",
         ));
     }
-    let voice = pick_voice(word, lang_hint, &zh_voice, &en_voice);
+    let voice = match voice_override {
+        Some(v) if (2..=32).contains(&v.len()) && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+            v.to_string()
+        }
+        _ => pick_voice(word, lang_hint, &zh_voice, &en_voice),
+    };
     let cache_key = format!("{voice}|{word}");
     if let Some(hit) = state.tts.audio.get(&cache_key) {
         return Ok(hit);
@@ -327,6 +342,37 @@ mod polyphone_probe {
                     Err(e) => println!("  {w}: ERR {e}"),
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod voices_probe {
+    #[test]
+    #[ignore = "需要本地模型"]
+    fn list_voices() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        let zh: Vec<String> = tts.voices().into_iter().filter(|v| v.starts_with('z')).collect();
+        println!("中文嗓音: {:?}", zh);
+    }
+}
+
+#[cfg(test)]
+mod preview_gen {
+    #[test]
+    #[ignore = "生成中文嗓音试听样本到 /tmp/tts-previews"]
+    fn gen_previews() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        let sentence = "豫章故郡，洪都新府。星分翼轸，地接衡庐。";
+        std::fs::create_dir_all("/tmp/tts-previews").unwrap();
+        for voice in tts.voices().into_iter().filter(|v| v.starts_with('z')) {
+            let audio = tts
+                .synthesize_with_options(sentence, Some(&voice), 1.0, 1.0, None)
+                .unwrap();
+            tts.save_wav(&format!("/tmp/tts-previews/{voice}.wav"), &audio).unwrap();
+            println!("{voice} ok");
         }
     }
 }

@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as settingsApi from '../../api/admin/settings'
+import { fetchTtsBlob } from '../../api/dict'
 import RefreshButton from '../../components/admin/RefreshButton.vue'
 
 const loading = ref(true)
@@ -39,7 +40,56 @@ const ONLINE_SOURCES = [
   { id: 'goodreads', label: 'Goodreads' },
 ]
 
+// Kokoro 内建嗓音（嗓音名决定语言）；下拉可手输任意合法名（allow-create）
+const ZH_VOICES = [
+  { value: 'zf_xiaobei', label: '晓贝（女，最标准）' },
+  { value: 'zf_xiaoxiao', label: '晓晓（女）' },
+  { value: 'zf_xiaoyi', label: '晓伊（女）' },
+  { value: 'zf_xiaoni', label: '晓妮（女，口音偏重）' },
+  { value: 'zm_yunjian', label: '云健（男，浑厚）' },
+  { value: 'zm_yunxi', label: '云希（男）' },
+  { value: 'zm_yunyang', label: '云扬（男，播音）' },
+  { value: 'zm_yunxia', label: '云夏（男）' },
+]
+const EN_VOICES = [
+  { value: 'af_heart', label: 'Heart（美音女，默认）' },
+  { value: 'af_sky', label: 'Sky（美音女）' },
+  { value: 'am_adam', label: 'Adam（美音男）' },
+  { value: 'am_michael', label: 'Michael（美音男）' },
+  { value: 'bf_emma', label: 'Emma（英音女）' },
+  { value: 'bm_george', label: 'George（英音男）' },
+]
 const onlineSourceSelection = ref<string[]>([])
+
+const previewingZh = ref(false)
+const previewingEn = ref(false)
+let previewAudio: HTMLAudioElement | null = null
+
+/** 试听：指定嗓音合成一句固定样本并播放（不落设置） */
+async function previewVoice(voice: string) {
+  if (!voice.trim()) return
+  const isZh = voice.startsWith('z')
+  const sample = isZh
+    ? '豫章故郡，洪都新府。星分翼轸，地接衡庐。'
+    : 'The apple is a sweet fruit that grows on trees.'
+  const flag = isZh ? previewingZh : previewingEn
+  flag.value = true
+  try {
+    const blob = new Blob(
+      [await fetchTtsBlob(sample, undefined, voice)],
+      { type: 'audio/wav' },
+    )
+    previewAudio?.pause()
+    const url = URL.createObjectURL(blob)
+    previewAudio = new Audio(url)
+    previewAudio.onended = () => URL.revokeObjectURL(url)
+    await previewAudio.play()
+  } catch {
+    /* 拦截器已提示 */
+  } finally {
+    flag.value = false
+  }
+}
 
 function syncSourceSelectionFromForm() {
   onlineSourceSelection.value = form.online_dict_sources
@@ -246,10 +296,33 @@ async function save() {
         </el-form-item>
         <div class="lang-row">
           <el-form-item label="中文嗓音">
-            <el-input v-model="form.tts_voice_zh" placeholder="zf_xiaoni" />
+            <div class="voice-row">
+              <el-select v-model="form.tts_voice_zh" filterable allow-create>
+                <el-option v-for="v in ZH_VOICES" :key="v.value" :label="v.label" :value="v.value" />
+              </el-select>
+              <el-button
+                :loading="previewingZh"
+                :disabled="!form.tts_enabled"
+                title="用这句试听当前选择的嗓音"
+                @click="previewVoice(form.tts_voice_zh)"
+              >
+                试听
+              </el-button>
+            </div>
           </el-form-item>
           <el-form-item label="英文嗓音">
-            <el-input v-model="form.tts_voice_en" placeholder="af_heart" />
+            <div class="voice-row">
+              <el-select v-model="form.tts_voice_en" filterable allow-create>
+                <el-option v-for="v in EN_VOICES" :key="v.value" :label="v.label" :value="v.value" />
+              </el-select>
+              <el-button
+                :loading="previewingEn"
+                :disabled="!form.tts_enabled"
+                @click="previewVoice(form.tts_voice_en)"
+              >
+                试听
+              </el-button>
+            </div>
           </el-form-item>
         </div>
         <p class="hint">
@@ -282,6 +355,16 @@ h1 {
   font-size: var(--text-xl);
   color: var(--color-text-primary);
   margin: 0;
+}
+
+.voice-row {
+  display: flex;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.voice-row .el-select {
+  flex: 1;
 }
 
 .lang-row {
