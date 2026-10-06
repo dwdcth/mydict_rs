@@ -297,3 +297,36 @@ mod tests {
         assert_eq!(first_audio_url(r#"<img src="a.png">"#, 7), None);
     }
 }
+
+#[cfg(test)]
+mod polyphone_probe {
+    /// 多音字探针：`cargo test -p server --lib polyphone -- --nocapture`
+    /// 看「好/行/长/重…」在不同词里的声调轮廓（→↗↓↘）是否正确变调
+    #[test]
+    #[ignore = "需要本地已下载 Kokoro 模型；cargo test -- --ignored 运行"]
+    fn probe_polyphones() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).expect("engine");
+        for (ch, words) in [
+            ("好", ["好奇", "好看"]),
+            ("行", ["银行", "行走"]),
+            ("长", ["长大", "长城"]),
+            ("重", ["重要", "重复"]),
+            ("得", ["得到", "觉得"]),
+            ("还", ["还有", "还钱"]),
+            ("都", ["首都", "都是"]),
+            ("了", ["了解", "好了"]),
+        ] {
+            println!("── {ch} ──");
+            for w in words {
+                match tts.phonemize(w, Some("zf_xiaoni")) {
+                    Ok(p) => println!("  {w}: {p}"),
+                    Err(e) => println!("  {w}: ERR {e}"),
+                }
+            }
+        }
+    }
+}
