@@ -182,9 +182,38 @@ pub async fn synthesize_wav_with_voice(
     .map_err(|e| AppError::internal("tts-join", e))?
     .map_err(|e| AppError::internal_msg(&format!("合成失败：{e}")))?;
 
-    let wav = Arc::new(f32_to_wav(&samples));
+    // 裁掉首尾静音：kokoro 输出常带 0.4s 头部 + 1s+ 尾部死寂，整句朗读时
+    // 「说完隔一秒又来一段」的听感就是它造成的
+    let trimmed = trim_silence(&samples);
+    let wav = Arc::new(f32_to_wav(&trimmed));
     state.tts.audio.insert(cache_key, wav.clone());
     Ok(wav)
+}
+
+/// 按能量裁首尾静音（阈值 0.6% 满幅；前后各留 60ms 自然余韵）
+fn trim_silence(samples: &[f32]) -> Vec<f32> {
+    const THRESHOLD: f32 = 0.006;
+    const MARGIN_FRAC: f32 = 0.06; // 60ms @24k
+    let window = 120; // 5ms 能量窗
+    let loud_at = |i: usize| -> bool {
+        let end = (i + window).min(samples.len());
+        samples[i..end].iter().any(|s| s.abs() > THRESHOLD)
+    };
+    let mut start = 0;
+    while start + window < samples.len() && !loud_at(start) {
+        start += window;
+    }
+    let mut end = samples.len();
+    while end > start + window && !loud_at(end.saturating_sub(window)) {
+        end -= window;
+    }
+    if start >= end || end - start < 2400 {
+        return samples.to_vec(); // 全静音/过短：保底返回原文
+    }
+    let margin = (SAMPLE_RATE as f32 * MARGIN_FRAC) as usize;
+    let from = start.saturating_sub(margin);
+    let to = (end + margin).min(samples.len());
+    samples[from..to].to_vec()
 }
 
 /// f32 样本（-1..1）→ WAV 字节（16-bit PCM mono，44 字节头）
