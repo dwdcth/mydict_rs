@@ -7,6 +7,7 @@ import { useUserAuthStore } from '../stores/userAuth'
 import { useSettingsStore } from '../stores/settings'
 import { listDictionaries } from '../api/dict'
 import { setAllowedDictionaries } from '../api/auth'
+import { fetchFlashcardStats } from '../api/flashcards'
 import ThemeToggle from './ThemeToggle.vue'
 import ApiTokenDialog from './ApiTokenDialog.vue'
 import ChangePasswordDialog from './ChangePasswordDialog.vue'
@@ -14,6 +15,18 @@ import DictionaryPickerDialog from './DictionaryPickerDialog.vue'
 import type { PublicDictionary } from '../types/query'
 
 const router = useRouter()
+
+// 到期复习数徽章：挂载时取一次，路由切换回来刷新
+const dueCount = ref(0)
+async function refreshDueBadge() {
+  if (!authStore.isLoggedIn) return
+  try {
+    const stats = await fetchFlashcardStats()
+    dueCount.value = stats.due_count
+  } catch {
+    /* 静默：徽章失败不影响导航 */
+  }
+}
 const authStore = useUserAuthStore()
 const settingsStore = useSettingsStore()
 const changePasswordVisible = ref(false)
@@ -32,6 +45,7 @@ onMounted(() => mobileQuery.addEventListener('change', onMobileChange))
 onBeforeUnmount(() => mobileQuery.removeEventListener('change', onMobileChange))
 
 onMounted(() => {
+  refreshDueBadge()
   if (!settingsStore.loaded) settingsStore.load().catch(() => undefined)
   if (authStore.isLoggedIn && !authStore.profile) authStore.loadProfile().catch(() => undefined)
 })
@@ -70,6 +84,9 @@ async function saveAllowedDictionaries(ids: number[] | null) {
     <nav class="nav-links">
       <router-link to="/" exact-active-class="active">查询</router-link>
       <router-link to="/vocab" active-class="active">生词本</router-link>
+      <router-link to="/review" active-class="active" @click="refreshDueBadge">
+        复习<span v-if="dueCount > 0" class="due-badge">{{ dueCount > 99 ? '99+' : dueCount }}</span>
+      </router-link>
       <router-link to="/history" active-class="active">历史</router-link>
     </nav>
 
@@ -213,4 +230,18 @@ async function saveAllowedDictionaries(ids: number[] | null) {
     display: none;
   }
 }
+  .due-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    margin-left: var(--space-1);
+    border-radius: var(--radius-full);
+    background: var(--color-danger);
+    color: #fff;
+    font-size: var(--text-xs);
+    line-height: 1;
+  }
 </style>

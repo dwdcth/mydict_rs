@@ -8,6 +8,7 @@ pub mod audit_service;
 pub mod background_task;
 pub mod dict_group;
 pub mod dictionary;
+pub mod flashcards;
 pub mod entry_scope;
 pub mod scope;
 pub mod settings_service;

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod dict;
+pub mod flashcards;
 pub mod groups;
 pub mod online;
 pub mod public_settings;

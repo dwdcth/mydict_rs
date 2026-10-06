@@ -59,6 +59,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 clap.workspace = true
+rs-fsrs = { version = "1.2.1", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"

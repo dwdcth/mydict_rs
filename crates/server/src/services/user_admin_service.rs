@@ -420,6 +420,8 @@ pub async fn generate_user_token(
         last_login_at: row.last_login_at,
         admin_scope_limited: row.admin_scope_limited,
         self_scope_limited: row.self_scope_limited,
+        fsrs_retention: None,
+        fsrs_weights: None,
     };
     token_service::issue_user_token(state, &user, Some(admin_id)).await?;
     user_out(state, &row).await

@@ -13,6 +13,7 @@ import RandomDictPanel from '../components/RandomDictPanel.vue'
 import SkeletonList from '../components/SkeletonList.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { searchWord } from '../api/dict'
+import { addFlashcard } from '../api/flashcards'
 import { getSystemInfo } from '../api/system'
 import { useUserAuthStore } from '../stores/userAuth'
 import { useSettingsStore } from '../stores/settings'
@@ -27,6 +28,16 @@ const route = useRoute()
 const authStore = useUserAuthStore()
 const settingsStore = useSettingsStore()
 const { favoriteMap, favoriteLoading, loadFavorites, toggleFavorite } = useFavorites()
+
+/** 查询面板「加入复习」：词条不在生词本会自动先收藏（后端一个调用完成） */
+async function handleAddFlashcard(word: string, dictionaryId: number) {
+  try {
+    const result = await addFlashcard(word, dictionaryId)
+    ElMessage.success(result.already ? `「${word}」已在复习计划中` : `「${word}」已加入复习`)
+  } catch {
+    // 未登录/限流等由响应拦截器提示
+  }
+}
 const {
   dictionaries,
   selectedIds,
@@ -578,6 +589,7 @@ function onRescroll(key: string) {
               :favorite-loading="favoriteLoading"
               @entry="searchFromEntry"
               @toggle-favorite="toggleFavorite"
+              @add-flashcard="handleAddFlashcard"
               @unsupported-audio="onUnsupportedAudio"
             />
           </template>
@@ -617,6 +629,7 @@ function onRescroll(key: string) {
               @entry="searchFromEntry"
               @escape="collapseOnEscape()"
               @toggle-favorite="toggleFavorite"
+              @add-flashcard="handleAddFlashcard"
               @unsupported-audio="onUnsupportedAudio"
               @rescroll="onRescroll(group.key)"
             />

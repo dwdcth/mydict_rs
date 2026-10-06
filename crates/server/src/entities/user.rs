@@ -9,6 +9,10 @@ pub struct Model {
     pub username: String,
     #[sea_orm(unique, nullable)]
     pub email: Option<String>,
+    /// FSRS 目标记忆率（NULL = 默认 0.9）
+    pub fsrs_retention: Option<f64>,
+    /// FSRS-4.5 自定义权重（19 位 JSON 数组文本；NULL = 默认）
+    pub fsrs_weights: Option<String>,
     pub password_hash: String,
     pub status: String,
     pub created_at: i64,

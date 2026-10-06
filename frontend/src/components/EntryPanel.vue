@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import EntryFrame from './EntryFrame.vue'
 import FavoriteButton from './FavoriteButton.vue'
+import FlashcardButton from './FlashcardButton.vue'
 import { favoriteKey } from '../composables/useFavorites'
 import { getEntryHtml, prefetchEntryHtml } from '../api/dict'
 import type { QueryResultItem } from '../types/query'
@@ -25,6 +26,7 @@ const emit = defineEmits<{
   toggle: []
   entry: [word: string]
   toggleFavorite: [word: string, dictionaryId: number]
+  addFlashcard: [word: string, dictionaryId: number]
   unsupportedAudio: []
   /** 分批切换后请求把面板滚回视口顶部（HomeView 复用展开时的滚动逻辑） */
   rescroll: []
@@ -177,6 +179,10 @@ function isLoading(word: string, dictionaryId: number) {
           :favorited="isFavorited(primary.word, primary.dictionary_id)"
           :loading="isLoading(primary.word, primary.dictionary_id)"
           @toggle="emit('toggleFavorite', primary.word, primary.dictionary_id)"
+        />
+        <FlashcardButton
+          :active="false"
+          @add="emit('addFlashcard', primary.word, primary.dictionary_id)"
         />
       </span>
     </header>

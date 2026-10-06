@@ -3583,6 +3583,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-fsrs"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a7e7d53c16e720833aa109509f46d4d6cc0c4c820f95b865df72c6118e9124"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4019,6 +4030,7 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "reqwest",
+ "rs-fsrs",
  "sea-orm",
  "sea-orm-migration",
  "serde",

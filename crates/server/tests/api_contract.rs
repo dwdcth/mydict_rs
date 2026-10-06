@@ -1334,3 +1334,188 @@ async fn dictionary_groups_crud_and_isolation() {
     let resp: Value = actix_test::call_and_read_body_json(&mut svc, req).await;
     assert_eq!(resp["groups"].as_array().unwrap().len(), 0);
 }
+
+// ── 闪卡复习（FSRS 间隔重复）─────────────────────────────────────
+
+#[actix_web::test]
+async fn flashcards_fsrs_full_flow() {
+    let app = spawn_app().await;
+    let dict_id = seed_dictionary(
+        &app.state,
+        "闪卡词典",
+        "en",
+        "en",
+        &[("apple", "n. 苹果"), ("banana", "n. 香蕉")],
+    )
+    .await;
+    let mut svc = init_service(&app.state).await;
+    let _: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/auth/register")
+            .set_json(serde_json::json!({
+                "username": "fsrsuser", "password": "password123", "email": "f@t.dev"
+            }))
+            .to_request(),
+    )
+    .await;
+    let login: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/auth/login")
+            .set_json(serde_json::json!({"username": "fsrsuser", "password": "password123"}))
+            .to_request(),
+    )
+    .await;
+    let token = login["access_token"].as_str().unwrap().to_string();
+
+    // 匿名 → 401
+    let resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/stats").to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 401);
+
+    // 查询的词加入闪卡（不在生词本 → 自动先收藏）
+    let added: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/flashcards")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"word": "apple", "dictionary_id": dict_id}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(added["already"], false);
+    let item_id = added["vocab_item_id"].as_i64().unwrap() as i32;
+
+    // 幂等：再加一次 already=true
+    let again: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/flashcards")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"word": "apple", "dictionary_id": dict_id}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(again["already"], true);
+    assert_eq!(again["vocab_item_id"].as_i64().unwrap() as i32, item_id);
+
+    // 统计：1 到期（新卡）
+    let stats: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/stats").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    assert_eq!(stats["due_count"], 1);
+    assert_eq!(stats["new_count"], 1);
+    assert_eq!(stats["total"], 1);
+
+    // 队列：新卡在前，四档预测齐全
+    let queue: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/queue").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    let items = queue["queue"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["word"], "apple");
+    for key in ["again", "hard", "good", "easy"] {
+        assert!(
+            items[0]["previews"][key]["interval_days"].is_i64(),
+            "缺 {key} 档预测：{items:?}"
+        );
+    }
+    // FSRS 常识：Easy 间隔 > Again 间隔
+    let again_iv = items[0]["previews"]["again"]["interval_days"].as_i64().unwrap();
+    let easy_iv = items[0]["previews"]["easy"]["interval_days"].as_i64().unwrap();
+    assert!(easy_iv >= again_iv, "Easy 间隔应不小于 Again：{again_iv} vs {easy_iv}");
+
+    // 评 Good → 间隔 ≥ 1 天，卡出队
+    let review: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri(&format!("/api/flashcards/{item_id}/review"))
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"rating": 3}))
+            .to_request(),
+    )
+    .await;
+    let interval = review["interval_days"].as_i64().unwrap();
+    assert!(interval >= 1, "新卡 Good 间隔应 ≥1 天：{review:?}");
+    let stats: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/stats").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    assert_eq!(stats["due_count"], 0, "复习后不该再到期：{stats:?}");
+    assert_eq!(stats["today_reviewed"], 1);
+    // 日志表有记录
+    {
+        use sea_orm::ConnectionTrait;
+        let n = app.state.db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+            app.state.db.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM flashcard_reviews",
+            [],
+        )).await.unwrap().unwrap();
+        assert_eq!(n.try_get::<i64>("", "n").unwrap(), 1);
+    }
+
+    // 参数：retention 0.95、非法权重 422、合法 19 位 OK
+    let put: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::put()
+            .uri("/api/flashcards/settings")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"retention": 0.95}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(put["retention"], 0.95);
+    let resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::put()
+            .uri("/api/flashcards/settings")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"weights": "[1,2,3]"}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 422);
+    let weights: Vec<f64> = (0..19).map(|i| i as f64 * 0.1 + 0.4).collect();
+    let put: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::put()
+            .uri("/api/flashcards/settings")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"weights": serde_json::to_string(&weights).unwrap()}))
+            .to_request(),
+    )
+    .await;
+    assert!(put["weights"].as_str().unwrap().starts_with('['), "{put:?}");
+
+    // 移出复习：卡没了、生词本条目还在
+    let resp: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::delete()
+            .uri(&format!("/api/flashcards/{item_id}"))
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp["ok"], true);
+    let stats: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/stats").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    assert_eq!(stats["total"], 0);
+    let vocab: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/vocab").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    assert_eq!(vocab["total"], 1, "生词本条目应保留：{vocab:?}");
+}
