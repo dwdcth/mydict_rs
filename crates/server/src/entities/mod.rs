@@ -9,6 +9,8 @@ pub mod api_token;
 pub mod audit_log;
 pub mod dictionary;
 pub mod dictionary_group;
+pub mod flashcard;
+pub mod flashcard_review;
 pub mod dictionary_group_item;
 pub mod dictionary_source;
 pub mod dict_entry;

@@ -1484,17 +1484,20 @@ async fn flashcards_fsrs_full_flow() {
     )
     .await;
     assert_eq!(resp.status().as_u16(), 422);
-    let weights: Vec<f64> = (0..19).map(|i| i as f64 * 0.1 + 0.4).collect();
-    let put: Value = actix_test::call_and_read_body_json(
-        &mut svc,
-        TestRequest::put()
-            .uri("/api/flashcards/settings")
-            .pipe_bearer(&token)
-            .set_json(serde_json::json!({"weights": serde_json::to_string(&weights).unwrap()}))
-            .to_request(),
-    )
-    .await;
-    assert!(put["weights"].as_str().unwrap().starts_with('['), "{put:?}");
+    // 19 位（FSRS-4.5 导出）与 21 位（FSRS-6）都被接受，短的自动补齐
+    for len in [19usize, 21] {
+        let weights: Vec<f64> = (0..len).map(|i| i as f64 * 0.1 + 0.4).collect();
+        let put: Value = actix_test::call_and_read_body_json(
+            &mut svc,
+            TestRequest::put()
+                .uri("/api/flashcards/settings")
+                .pipe_bearer(&token)
+                .set_json(serde_json::json!({"weights": serde_json::to_string(&weights).unwrap()}))
+                .to_request(),
+        )
+        .await;
+        assert!(put["weights"].as_str().unwrap_or("").starts_with('['), "len={len}: {put:?}");
+    }
 
     // 移出复习：卡没了、生词本条目还在
     let resp: Value = actix_test::call_and_read_body_json(

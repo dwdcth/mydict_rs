@@ -6,54 +6,58 @@
 //! （19 位 FSRS-4.5 权重 JSON；NULL = 默认）。
 
 use chrono::{DateTime, Utc};
-use rs_fsrs::{Card, FSRS, Parameters, Rating};
+use fsrs::{FSRS, DEFAULT_PARAMETERS, MemoryState};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::{json, Value};
 
 use crate::core::errors::AppError;
 use crate::AppState;
 
-/// 权重维度（FSRS-4.5）
-const WEIGHT_COUNT: usize = 19;
+/// fsrs crate 接受的权重长度（FSRS-4.5/5/6；短的会自动补齐升级到 21 位 FSRS-6）
+const ACCEPTED_WEIGHT_COUNTS: [usize; 3] = [17, 19, 21];
 /// 目标记忆率合理区间
 const RETENTION_RANGE: (f64, f64) = (0.7, 0.99);
 /// 单次复习会话默认取的队列长度
 pub const QUEUE_LIMIT: i64 = 50;
 
-fn ts_to_datetime(ts: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now)
+/// 用户的 FSRS 配置（模型 + 目标记忆率；retention 按 fsrs 的 per-call 语义传）
+struct UserFsrs {
+    model: FSRS,
+    retention: f32,
 }
 
 fn datetime_to_ts(dt: DateTime<Utc>) -> i64 {
     dt.timestamp()
 }
 
-/// 用户的 FSRS 实例：目标记忆率/自定义权重（缺失或非法则回默认）
-pub fn fsrs_for(retention: Option<f64>, weights: Option<&str>) -> FSRS {
-    let mut params = Parameters {
-        // 天粒度调度（无当日分钟级学习步骤）：词典复习是低频场景，
-        // Again 的复习落在明天而不是几分钟后
-        enable_short_term: false,
-        ..Parameters::default()
-    };
-    if let Some(r) = retention {
-        params.request_retention = r.clamp(RETENTION_RANGE.0, RETENTION_RANGE.1);
-    }
-    if let Some(raw) = weights {
-        if let Ok(list) = serde_json::from_str::<Vec<f64>>(raw) {
-            if list.len() == WEIGHT_COUNT && list.iter().all(|w| w.is_finite()) {
-                let mut w = params.w;
-                for (i, v) in list.iter().enumerate() {
-                    w[i] = *v;
-                }
-                params.w = w;
+/// 用户的 FSRS 模型：默认 FSRS-6（21 参数，Anki 当前默认）；自定义权重按长度
+/// 自动识别版本（17/19/21/34，短版本会被 check_and_fill 自动补齐升级）
+pub fn build_model(weights: Option<&str>) -> Result<FSRS, AppError> {
+    let params: Vec<f32> = match weights {
+        Some(raw) => match serde_json::from_str::<Vec<f64>>(raw) {
+            Ok(list)
+                if ACCEPTED_WEIGHT_COUNTS.contains(&list.len())
+                    && list.iter().all(|w| w.is_finite()) =>
+            {
+                list.iter().map(|v| *v as f32).collect()
             }
-        }
-    }
-    FSRS::new(params)
+            _ => {
+                return Err(AppError::validation(format!(
+                    "权重须是 {} 中任一长度的数值 JSON 数组（FSRS-4.5/5/6/7）",
+                    ACCEPTED_WEIGHT_COUNTS
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )))
+            }
+        },
+        None => DEFAULT_PARAMETERS.to_vec(),
+    };
+    FSRS::new(&params).map_err(|e| AppError::validation(format!("权重无效：{e}")))
 }
 
-async fn user_fsrs(db: &DatabaseConnection, user_id: i32) -> Result<FSRS, AppError> {
+async fn user_fsrs(db: &DatabaseConnection, user_id: i32) -> Result<UserFsrs, AppError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
@@ -63,44 +67,48 @@ async fn user_fsrs(db: &DatabaseConnection, user_id: i32) -> Result<FSRS, AppErr
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("用户不存在"))?;
-    Ok(fsrs_for(
-        row.try_get::<Option<f64>>("", "fsrs_retention")
-            .ok()
-            .flatten(),
-        row.try_get::<Option<String>>("", "fsrs_weights")
-            .ok()
-            .flatten()
-            .as_deref(),
-    ))
+    let retention = row
+        .try_get::<Option<f64>>("", "fsrs_retention")
+        .ok()
+        .flatten()
+        .unwrap_or(0.9)
+        .clamp(RETENTION_RANGE.0, RETENTION_RANGE.1) as f32;
+    // 权重列由写入路径保证合法；万一非法（手改库）回退默认而不是 500
+    let weights = row
+        .try_get::<Option<String>>("", "fsrs_weights")
+        .ok()
+        .flatten();
+    let model = build_model(weights.as_deref()).unwrap_or_else(|_| {
+        FSRS::new(&DEFAULT_PARAMETERS).expect("默认参数合法")
+    });
+    Ok(UserFsrs { model, retention })
 }
 
-/// 数据库行 → rs-fsrs Card
-fn card_from(row: &sea_orm::QueryResult) -> Card {
-    Card {
-        due: ts_to_datetime(row.try_get::<i64>("", "due").unwrap_or_default()),
-        stability: row.try_get::<f64>("", "stability").unwrap_or_default(),
-        difficulty: row.try_get::<f64>("", "difficulty").unwrap_or_default(),
-        elapsed_days: row.try_get::<i64>("", "elapsed_days").unwrap_or_default(),
-        scheduled_days: row.try_get::<i64>("", "scheduled_days").unwrap_or_default(),
-        reps: row.try_get::<i32>("", "reps").unwrap_or_default(),
-        lapses: row.try_get::<i32>("", "lapses").unwrap_or_default(),
-        state: match row.try_get::<i64>("", "state").unwrap_or_default() {
-            1 => rs_fsrs::State::Learning,
-            2 => rs_fsrs::State::Review,
-            3 => rs_fsrs::State::Relearning,
-            _ => rs_fsrs::State::New,
-        },
-        last_review: ts_to_datetime(row.try_get::<i64>("", "last_review").unwrap_or_default()),
+/// 数据库行 → MemoryState（reps=0 的新卡传 None）
+fn memory_of(row: &sea_orm::QueryResult) -> Option<MemoryState> {
+    let reps = row.try_get::<i32>("", "reps").unwrap_or_default();
+    if reps == 0 {
+        return None;
     }
+    Some(MemoryState {
+        stability: row.try_get::<f64>("", "stability").unwrap_or_default() as f32,
+        difficulty: row.try_get::<f64>("", "difficulty").unwrap_or_default() as f32,
+    })
 }
 
-fn state_to_i32(state: rs_fsrs::State) -> i32 {
-    match state {
-        rs_fsrs::State::New => 0,
-        rs_fsrs::State::Learning => 1,
-        rs_fsrs::State::Review => 2,
-        rs_fsrs::State::Relearning => 3,
+/// 距上次复习的天数（新卡 0）
+fn elapsed_days_of(row: &sea_orm::QueryResult) -> u32 {
+    let reps = row.try_get::<i32>("", "reps").unwrap_or_default();
+    if reps == 0 {
+        return 0;
     }
+    let last = row.try_get::<i64>("", "last_review").unwrap_or_default();
+    (Utc::now().timestamp() - last).max(0).div_euclid(86400) as u32
+}
+
+/// fsrs 的 f32 天间隔 → 我们的天粒度整数（Again 也落明天，与原 longterm 语义一致）
+fn interval_days(interval: f32) -> i64 {
+    interval.round().max(1.0) as i64
 }
 
 fn human_interval(days: i64) -> String {
@@ -209,20 +217,21 @@ pub async fn review_queue(
 
     let items: Vec<Value> = rows
         .iter()
-        .map(|row| {
-            let card = card_from(row);
-            // 四档预测（repeat 不写库，只算）
-            let log = fsrs.repeat(card.clone(), now);
-            let preview = |rating: Rating| -> Value {
-                match log.get(&rating) {
-                    Some(info) => json!({
-                        "interval_days": info.card.scheduled_days,
-                        "label": human_interval(info.card.scheduled_days),
-                    }),
-                    None => Value::Null,
-                }
+        .map(|row| -> Result<Value, AppError> {
+            // 四档预测（只算不写库）
+            let states = fsrs
+                .model
+                .next_states(memory_of(row), fsrs.retention, elapsed_days_of(row))
+                .map_err(|e| AppError::internal("fsrs", e))?;
+            let preview = |item: &fsrs::ItemState| -> Value {
+                let days = interval_days(item.interval);
+                json!({
+                    "interval_days": days,
+                    "label": human_interval(days),
+                })
             };
-            json!({
+            Ok(json!({
+
                 "vocab_item_id": row.try_get::<i32>("", "vocab_item_id").unwrap_or_default(),
                 "word": row.try_get::<String>("", "word").unwrap_or_default(),
                 "phonetic": row.try_get::<Option<String>>("", "phonetic").ok().flatten(),
@@ -232,14 +241,14 @@ pub async fn review_queue(
                 "reps": row.try_get::<i32>("", "reps").unwrap_or_default(),
                 "lapses": row.try_get::<i32>("", "lapses").unwrap_or_default(),
                 "previews": {
-                    "again": preview(Rating::Again),
-                    "hard": preview(Rating::Hard),
-                    "good": preview(Rating::Good),
-                    "easy": preview(Rating::Easy),
+                    "again": preview(&states.again),
+                    "hard": preview(&states.hard),
+                    "good": preview(&states.good),
+                    "easy": preview(&states.easy),
                 },
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, AppError>>()?;
     Ok(json!({ "queue": items, "now": datetime_to_ts(now) }))
 }
 
@@ -250,13 +259,9 @@ pub async fn review_card(
     vocab_item_id: i32,
     rating: i32,
 ) -> Result<Value, AppError> {
-    let rating = match rating {
-        1 => Rating::Again,
-        2 => Rating::Hard,
-        3 => Rating::Good,
-        4 => Rating::Easy,
-        _ => return Err(AppError::validation("rating 须为 1-4")),
-    };
+    if !(1..=4).contains(&rating) {
+        return Err(AppError::validation("rating 须为 1-4"));
+    }
     let backend = state.db.get_database_backend();
     let row = state
         .db
@@ -272,26 +277,48 @@ pub async fn review_card(
 
     let fsrs = user_fsrs(&state.db, user_id).await?;
     let now = Utc::now();
-    let info = fsrs.next(card_from(&row), now, rating);
-    let next = info.card;
+    let elapsed = elapsed_days_of(&row);
+    let states = fsrs
+        .model
+        .next_states(memory_of(&row), fsrs.retention, elapsed)
+        .map_err(|e| AppError::internal("fsrs", e))?;
+    let (item, chosen) = match rating {
+        1 => (&states.again, "again"),
+        2 => (&states.hard, "hard"),
+        3 => (&states.good, "good"),
+        _ => (&states.easy, "easy"),
+    };
+    let _ = chosen;
+    let memory = item.memory;
+    let scheduled = interval_days(item.interval);
+    let previous_reps = row.try_get::<i32>("", "reps").unwrap_or_default();
+    let previous_lapses = row.try_get::<i32>("", "lapses").unwrap_or_default();
+    // 状态迁移（显示用）：Again → 重学中；其余 → 复习中
+    let new_state = if rating == 1 { 3 } else { 2 };
+    let new_reps = previous_reps + 1;
+    let new_lapses = previous_lapses + i32::from(rating == 1);
+    let due = datetime_to_ts(now + chrono::Duration::days(scheduled));
 
     state
         .db
         .execute_raw(Statement::from_sql_and_values(
             backend,
             "UPDATE flashcards SET state=$1, due=$2, stability=$3, difficulty=$4, \
-             elapsed_days=$5, scheduled_days=$6, reps=$7, lapses=$8, last_review=$9 \
-             WHERE vocab_item_id = $10",
+             elapsed_days=$5, scheduled_days=$6, reps=$7, lapses=$8, last_review=$9, \
+             stability_fast=$10, last_rating=$11 \
+             WHERE vocab_item_id = $12",
             [
-                state_to_i32(next.state).into(),
-                datetime_to_ts(next.due).into(),
-                next.stability.into(),
-                next.difficulty.into(),
-                next.elapsed_days.into(),
-                next.scheduled_days.into(),
-                next.reps.into(),
-                next.lapses.into(),
-                datetime_to_ts(next.last_review).into(),
+                new_state.into(),
+                due.into(),
+                (memory.stability as f64).into(),
+                (memory.difficulty as f64).into(),
+                (elapsed as i64).into(),
+                scheduled.into(),
+                new_reps.into(),
+                new_lapses.into(),
+                datetime_to_ts(now).into(),
+                (memory.stability as f64).into(),
+                rating.into(),
                 vocab_item_id.into(),
             ],
         ))
@@ -305,10 +332,10 @@ pub async fn review_card(
              VALUES ($1, $2, $3, $4, $5, $6)",
             [
                 vocab_item_id.into(),
-                (rating as i32).into(),
-                state_to_i32(info.review_log.state).into(),
-                info.review_log.elapsed_days.into(),
-                info.review_log.scheduled_days.into(),
+                rating.into(),
+                new_state.into(),
+                (elapsed as i64).into(),
+                scheduled.into(),
                 datetime_to_ts(now).into(),
             ],
         ))
@@ -317,12 +344,12 @@ pub async fn review_card(
 
     Ok(json!({
         "vocab_item_id": vocab_item_id,
-        "interval_days": next.scheduled_days,
-        "interval_label": human_interval(next.scheduled_days),
-        "due_at": datetime_to_ts(next.due),
-        "state": state_to_i32(next.state),
-        "reps": next.reps,
-        "lapses": next.lapses,
+        "interval_days": scheduled,
+        "interval_label": human_interval(scheduled),
+        "due_at": due,
+        "state": new_state,
+        "reps": new_reps,
+        "lapses": new_lapses,
     }))
 }
 
@@ -487,12 +514,22 @@ pub async fn update_settings(
         None => None,
         Some("") => Some(None),
         Some(raw) => match serde_json::from_str::<Vec<f64>>(raw) {
-            Ok(list) if list.len() == WEIGHT_COUNT && list.iter().all(|w| w.is_finite()) => {
+            Ok(list)
+                if ACCEPTED_WEIGHT_COUNTS.contains(&list.len())
+                    && list.iter().all(|w| w.is_finite()) =>
+            {
+                // 再让 fsrs crate 自己过一遍（check_and_fill 会补齐/校验）
+                build_model(Some(raw))?;
                 Some(Some(raw.to_string()))
             }
             _ => {
                 return Err(AppError::validation(format!(
-                    "权重须是 {WEIGHT_COUNT} 个数值的 JSON 数组（FSRS-4.5 格式）"
+                    "权重须是 {} 中任一长度的数值 JSON 数组（FSRS-4.5/5/6/7，短版本自动补齐）",
+                    ACCEPTED_WEIGHT_COUNTS
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("/")
                 )))
             }
         },

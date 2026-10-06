@@ -156,11 +156,11 @@ async function saveSettings() {
   if (weights) {
     try {
       const parsed = JSON.parse(weights)
-      if (!Array.isArray(parsed) || parsed.length !== 19 || !parsed.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      if (![17, 19, 21].includes(parsed?.length ?? 0) || !parsed!.every((v: unknown) => typeof v === 'number' && Number.isFinite(v))) {
         throw new Error('bad')
       }
     } catch {
-      ElMessage.warning('权重须是 19 个数值的 JSON 数组（FSRS-4.5 格式，ts-fsrs / Anki 导出）')
+      ElMessage.warning('权重须是 17/19/21 个数值的 JSON 数组（FSRS-4.5/5/6，Anki 导出均可，短版本自动补齐）')
       return
     }
   }
@@ -306,7 +306,7 @@ function dueLabel(dueAt: number) {
           <el-input v-model="retentionInput" placeholder="0.9" />
           <p class="hint">越高记得越牢、复习越勤（间隔越短）；默认 0.9。</p>
         </el-form-item>
-        <el-form-item label="自定义权重（可选，19 位 FSRS-4.5 JSON 数组）">
+        <el-form-item label="自定义权重（可选，17/19/21 位 JSON 数组）">
           <el-input
             v-model="weightsInput"
             type="textarea"
@@ -314,7 +314,8 @@ function dueLabel(dueAt: number) {
             placeholder='[0.4072, 1.1829, …] 共 19 个数值；留空用默认'
           />
           <p class="hint">
-            从 ts-fsrs / Anki（FSRS-4.5）导出的权重串粘贴进来即生效；清空恢复默认。
+            从 Anki（FSRS-4.5/5/6）导出的权重串粘贴进来即生效，短版本自动补齐到
+            FSRS-6；清空恢复默认。默认即 FSRS-6（21 参数，Anki 当前同款）。
           </p>
         </el-form-item>
       </el-form>
