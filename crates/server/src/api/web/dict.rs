@@ -396,7 +396,12 @@ pub async fn word_audio(
 
 #[derive(Deserialize)]
 pub struct TtsQuery {
-    pub word: String,
+    /// 兼容旧参数名（单词条头）
+    #[serde(default)]
+    pub word: Option<String>,
+    /// 选区朗读：整句/整段文本
+    #[serde(default)]
+    pub text: Option<String>,
     /// 可选语言提示（词条 lang_from）；缺省按词形自动判
     #[serde(default)]
     pub lang: Option<String>,
@@ -417,7 +422,12 @@ pub async fn word_tts(
         caller.user.as_ref().map(|u| u.id),
     )
     .await?;
-    let wav = crate::services::tts::synthesize_wav(&app, &query.word, query.lang.as_deref()).await?;
+    let text = query
+        .text
+        .clone()
+        .or_else(|| query.word.clone())
+        .unwrap_or_default();
+    let wav = crate::services::tts::synthesize_wav(&app, &text, query.lang.as_deref()).await?;
     Ok(HttpResponse::Ok()
         .content_type("audio/wav")
         .insert_header((

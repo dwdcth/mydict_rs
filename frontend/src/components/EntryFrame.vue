@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useTheme } from '../composables/useTheme'
+import { useTtsPlayer } from '../utils/ttsPlayer'
 import ImageLightbox from './ImageLightbox.vue'
 
 const props = defineProps<{
@@ -200,6 +201,12 @@ function onMessage(event: MessageEvent) {
       break
     case 'mydict:audio-error':
       ElMessage.warning('发音播放失败')
+      break
+    case 'mydict:tts':
+      // 词条内选中整句【朗读】：父页全局播放器合成并播放（状态胶囊显示进度）
+      if (typeof data.text === 'string' && data.text.trim()) {
+        useTtsPlayer().play(String(data.text))
+      }
       break
     default:
       break

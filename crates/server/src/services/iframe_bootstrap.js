@@ -751,6 +751,8 @@
   var LOOKUP_MIN_CHARS = 1
   // 超过这个长度基本是整行/整段拖选，不是要查的词
   var LOOKUP_MAX_CHARS = 30
+  // 朗读可以接受整句/整段（选区朗读的上限）
+  var TTS_MAX_CHARS = 500
   var lookupMenu = null
   var lookupText = ''
 
@@ -760,11 +762,11 @@
     lookupText = ''
   }
 
-  function selectedText() {
+  function selectedText(maxChars) {
     var selection = window.getSelection && window.getSelection()
     if (!selection || selection.isCollapsed || !selection.rangeCount) return null
     var text = selection.toString().replace(/\s+/g, ' ').trim()
-    if (text.length < LOOKUP_MIN_CHARS || text.length > LOOKUP_MAX_CHARS) return null
+    if (text.length < LOOKUP_MIN_CHARS || text.length > maxChars) return null
     return text
   }
 
@@ -773,35 +775,53 @@
     lookupText = text
     var rect = range.getBoundingClientRect()
 
-    lookupMenu = document.createElement('div')
-    lookupMenu.className = 'mydict-lookup'
-    lookupMenu.setAttribute('role', 'button')
-    lookupMenu.textContent = '查词'
+    // 双按钮容器：【查词】+【朗读】（朗读 = 选区 TTS，超过查词 30 字也放行）
+    var bar = document.createElement('div')
+    bar.className = 'mydict-lookup-bar'
+    var lookupBtn = document.createElement('div')
+    lookupBtn.className = 'mydict-lookup'
+    lookupBtn.setAttribute('role', 'button')
+    lookupBtn.textContent = '查词'
+    var ttsBtn = document.createElement('div')
+    ttsBtn.className = 'mydict-lookup mydict-lookup-tts'
+    ttsBtn.setAttribute('role', 'button')
+    ttsBtn.textContent = '🔊 朗读'
+    bar.appendChild(lookupBtn)
+    bar.appendChild(ttsBtn)
     // 先藏起来挂上去，量完尺寸再定位，免得在左上角闪一下
-    lookupMenu.style.visibility = 'hidden'
-    ;(document.documentElement || document.body).appendChild(lookupMenu)
+    bar.style.visibility = 'hidden'
+    ;(document.documentElement || document.body).appendChild(bar)
+    lookupMenu = bar
 
-    var width = lookupMenu.offsetWidth
-    var height = lookupMenu.offsetHeight
+    var width = bar.offsetWidth
+    var height = bar.offsetHeight
     var gap = 6
     var top = rect.bottom + gap
     // 底边放不下就翻到选区上方，再放不下就贴顶
     if (top + height > window.innerHeight) top = Math.max(0, rect.top - height - gap)
     var left = Math.max(0, Math.min(rect.left + rect.width / 2 - width / 2,
                                   window.innerWidth - width))
-    lookupMenu.style.top = top + 'px'
-    lookupMenu.style.left = left + 'px'
-    lookupMenu.style.visibility = 'visible'
+    bar.style.top = top + 'px'
+    bar.style.left = left + 'px'
+    bar.style.visibility = 'visible'
 
     // mousedown 必须拦：不拦的话点按钮会先把选区清掉，然后才轮到 click，查词就查了个空
-    lookupMenu.addEventListener('mousedown', function (event) {
+    bar.addEventListener('mousedown', function (event) {
       event.preventDefault()
       event.stopPropagation()
     })
-    lookupMenu.addEventListener('click', function (event) {
+    lookupBtn.addEventListener('click', function (event) {
       event.preventDefault()
       event.stopPropagation()
       if (lookupText) send('entry', { word: lookupText })
+      hideLookupMenu()
+    })
+    ttsBtn.addEventListener('click', function (event) {
+      event.preventDefault()
+      event.stopPropagation()
+      // 整句朗读（≤500 字）；父页合成并播放，状态由父页的朗读胶囊显示
+      var sentence = selectedText(TTS_MAX_CHARS) || lookupText
+      send('tts', { text: sentence })
       hideLookupMenu()
     })
   }
@@ -809,7 +829,7 @@
   function onLookupMouseUp(event) {
     if (event.button !== 0) return
     if (lookupMenu && lookupMenu.contains(event.target)) return
-    var text = selectedText()
+    var text = selectedText(TTS_MAX_CHARS)
     var selection = window.getSelection && window.getSelection()
     if (!text || !selection || !selection.rangeCount) {
       hideLookupMenu()
@@ -820,7 +840,7 @@
 
   function onLookupSelectionChange() {
     // 只在菜单已经显示时才管——拖选过程中这个事件会疯狂触发
-    if (lookupMenu && selectedText() !== lookupText) hideLookupMenu()
+    if (lookupMenu && selectedText(TTS_MAX_CHARS) !== lookupText) hideLookupMenu()
   }
 
   function onLookupMouseDown(event) {

@@ -171,9 +171,9 @@ export function fetchWordAudio(word: string, dictionaryId: number) {
 }
 
 /** TTS 词语合成（kokoro-micro，WAV blob；首次合成 1-2 秒） */
-export function fetchTtsBlob(word: string, lang?: string) {
+export function fetchTtsBlob(text: string, lang?: string) {
   return request.get<BlobPart, BlobPart>('/dict/tts', {
-    params: { word, lang },
+    params: { text, lang },
     responseType: 'blob',
     timeout: 60_000,
   })

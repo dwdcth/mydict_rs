@@ -96,8 +96,8 @@ pub async fn synthesize_wav(
     lang_hint: Option<&str>,
 ) -> Result<Arc<Vec<u8>>, AppError> {
     let word = word.trim();
-    if word.is_empty() || word.chars().count() > 120 {
-        return Err(AppError::validation("word 无效"));
+    if word.is_empty() || word.chars().count() > 500 {
+        return Err(AppError::validation("文本为空或超过 500 字"));
     }
     let (enabled, zh_voice, en_voice) = tts_settings(&state.db).await?;
     if !enabled {

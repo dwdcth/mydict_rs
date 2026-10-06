@@ -54,13 +54,16 @@ const NO_HSCROLL_STYLE: &str = "<style>html{overflow-x:clip}</style>";
 /// 选中文字弹【查词】按钮的样式（fixed 定位不参与 scrollHeight，不干扰高度上报）
 const LOOKUP_STYLE: &str = concat!(
     "<style>",
-    ".mydict-lookup{position:fixed;z-index:2147483647;padding:4px 12px;border-radius:6px;",
+    ".mydict-lookup-bar{position:fixed;z-index:2147483647;display:flex;gap:6px;",
+    "font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif}",
+    ".mydict-lookup{padding:4px 12px;border-radius:6px;",
     "font-size:13px;line-height:1.7;cursor:pointer;user-select:none;-webkit-user-select:none;",
     "white-space:nowrap;background:#fff;color:#0f2b22;border:1px solid #d8e2de;",
-    "box-shadow:0 4px 14px rgba(0,0,0,.16);",
-    "font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif}",
+    "box-shadow:0 4px 14px rgba(0,0,0,.16)}",
+    ".mydict-lookup-tts{color:#0b62d6;border-color:#c5d8f2}",
     "[data-mydict-theme='dark'] .mydict-lookup{background:#1c2a25;color:#eaf1ee;",
     "border-color:#33443d;box-shadow:0 4px 14px rgba(0,0,0,.5)}",
+    "[data-mydict-theme='dark'] .mydict-lookup-tts{color:#8ab4f8;border-color:#2d4470}",
     "</style>"
 );
 

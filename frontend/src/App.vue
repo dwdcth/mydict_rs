@@ -3,6 +3,8 @@ import { watch } from 'vue'
 import { RouterView } from 'vue-router'
 import MaintenanceScreen from './components/MaintenanceScreen.vue'
 import ScrollButtons from './components/ScrollButtons.vue'
+import SelectionTtsPopup from './components/SelectionTtsPopup.vue'
+import TtsStatusPill from './components/TtsStatusPill.vue'
 import { useSettingsStore } from './stores/settings'
 import { useSystemStatusStore } from './stores/systemStatus'
 
@@ -24,5 +26,7 @@ watch(
   <template v-else>
     <RouterView />
     <ScrollButtons />
+    <SelectionTtsPopup />
+    <TtsStatusPill />
   </template>
 </template>
