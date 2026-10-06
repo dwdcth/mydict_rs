@@ -71,6 +71,11 @@ impl AppError {
         err
     }
     /// DB 错误 → 500（不给调用方暴露内部细节，日志里记全量）
+    /// 带用户可读消息的 500（TTS 未启用/引擎不可用等服务状态说明）
+    pub fn internal_msg(message: &str) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+    }
+
     pub fn internal(context: &str, source: impl std::fmt::Display) -> Self {
         tracing::error!(context, error = %source, "internal database error");
         Self::new(

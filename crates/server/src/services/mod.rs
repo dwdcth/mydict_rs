@@ -26,6 +26,7 @@ pub mod definition_repair;
 pub mod online_dict_service;
 pub mod stats_service;
 pub mod token_service;
+pub mod tts;
 pub mod user_admin_service;
 pub mod user_auth_service;
 pub mod vocab_service;

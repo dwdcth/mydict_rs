@@ -31,6 +31,7 @@
 | 词典组 | 无 | GoldenDict 式词典组：Web 用户自建命名组（`/api/dict/groups` CRUD），查询时一键切换检索范围 |
 | 间隔复习 | 无 | FSRS-6 闪卡（官方 fsrs crate，21 参数）：查询的词一键进复习，独立复习页（空卡/选择题双模式、键盘快捷键、预测间隔、记忆率显示），每用户可调目标记忆率/导入权重 |
 | 学习工具 | 无 | 例句挖空测验（释义抽句→挖空→同词典干扰项→4 选 1，答对/答错映射 FSRS）；文本词频分析（贴文/上传 .txt/.epub→分词去停用词→词典验证→勾选批量入本/进复习）；每日一词；生词本 Anki TSV 导出；词条 A-Z 浏览模式 |
+| TTS 发音 | 无 | 词条头发音按钮：词典有语音→字典喇叭；无语音→「喇叭+T」用内嵌 kokoro-micro（Kokoro-82M，九语、中英嗓音可配）合成，词典音频失效自动回退 TTS；结果按词缓存 |
 | 词典兼容 | 基础 | 资源五级容错（多次 percent-decode / simplified 变体 / basename 回退 / 后缀包含兜底 / 外部 CSS 空响应）与伴生 JS 变体（{名}-jquery.js 等，吸收自 PythonMDict 的真实词典踩坑清单） |
 
 ## 部署
@@ -60,6 +61,16 @@ cd frontend && npm run build  # 前端构建到 frontend/dist（STATIC_DIR 指�
 
 - `DATABASE_URL`：非空则优先（支持 postgres:// / mysql://），否则用 `DATABASE_PATH` 的 SQLite
 - `STATIC_DIR`：前端产物目录（默认 `static`，Docker 内 `/app/static`）
+
+## TTS 构建与部署说明（kokoro）
+
+- 编译期：pyke 预编译 onnxruntime 需 glibc≥2.38（Debian 12 是 2.36）。仓库提供
+  `make fetch-ort`：下载同款 ms@1.23.2 静态库 + `scripts/isoc23_shim.c` 垫片
+  （把 `__isoc23_*` 转发到普通 strtol 族），然后
+  `ORT_LIB_LOCATION=$(pwd)/.cache/onnxruntime-123 cargo build`
+- 运行期：管理后台开启 TTS 后，首次合成自动下载 Kokoro 模型（~337MB）到
+  `~/.cache/k/`（容器建议挂卷持久化）；之后按词×嗓音缓存（128MB），重复播放零成本
+- 中文嗓音 `zf_xiaoni`、英文 `af_heart` 可在系统设置里改（嗓音名决定语言）
 
 ## 环境要求
 

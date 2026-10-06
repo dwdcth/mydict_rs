@@ -8,3 +8,4 @@ frontend/dist
 .staging/
 # 测试语料（脚本生成，不入库）
 /testdata/
+.cache/

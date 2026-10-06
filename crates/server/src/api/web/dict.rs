@@ -365,10 +365,74 @@ fn md5_like_seed(input: &str) -> u64 {
     hash
 }
 
+#[derive(Deserialize)]
+pub struct WordAudioQuery {
+    pub word: String,
+    pub dict: i32,
+}
+
+/// GET /api/dict/audio —— 词条的词典语音地址（无则 null；前端据此决定
+/// 「字典喇叭」还是「喇叭+T」的 TTS 兜底）
+pub async fn word_audio(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+    query: web::Query<WordAudioQuery>,
+) -> Result<web::Json<Value>, AppError> {
+    let _caller = get_web_caller(&req, &app).await?;
+    let word = query.word.trim();
+    if word.is_empty() {
+        return Err(AppError::validation("word 不能为空"));
+    }
+    let entry = query::get_entry(&app, query.dict, word).await?;
+    let audio_url = entry
+        .as_ref()
+        .and_then(|e| crate::services::tts::first_audio_url(&e.definition, query.dict));
+    Ok(web::Json(json!({
+        "word": entry.as_ref().map(|e| e.word.clone()).unwrap_or_else(|| word.to_string()),
+        "dictionary_id": query.dict,
+        "audio_url": audio_url,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct TtsQuery {
+    pub word: String,
+    /// 可选语言提示（词条 lang_from）；缺省按词形自动判
+    #[serde(default)]
+    pub lang: Option<String>,
+}
+
+/// GET /api/dict/tts —— 词语合成发音（kokoro-micro，WAV）。
+/// 词典语音的兜底：前端在词条无音频时用「喇叭+T」按钮调它。
+pub async fn word_tts(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+    query: web::Query<TtsQuery>,
+) -> Result<HttpResponse, AppError> {
+    let caller = get_web_caller(&req, &app).await?;
+    web_rate_limit::enforce_search_rate(
+        &app,
+        caller.user.is_some(),
+        &caller.ip,
+        caller.user.as_ref().map(|u| u.id),
+    )
+    .await?;
+    let wav = crate::services::tts::synthesize_wav(&app, &query.word, query.lang.as_deref()).await?;
+    Ok(HttpResponse::Ok()
+        .content_type("audio/wav")
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=86400",
+        ))
+        .body(wav.to_vec()))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/dict/dictionaries", web::get().to(dictionaries))
         .route("/dict/search", web::get().to(search))
         .route("/dict/entry/{dictionary_id}", web::get().to(entry))
         .route("/dict/history", web::get().to(history))
-        .route("/dict/word-of-the-day", web::get().to(word_of_the_day));
+        .route("/dict/word-of-the-day", web::get().to(word_of_the_day))
+        .route("/dict/audio", web::get().to(word_audio))
+        .route("/dict/tts", web::get().to(word_tts));
 }

@@ -22,6 +22,9 @@ path = "src/bin/cli.rs"
 dict-parser = { path = "../dict-parser" }
 mdictlib.workspace = true
 zip.workspace = true
+# 钉 rc.11：其预编译 onnxruntime(ms@1.23.2) 与 Debian 12 / glibc 2.36 兼容；
+# rc.13 捆绑的 ms@1.28.0 需要 glibc>=2.38（__isoc23_* 符号）
+ort = { workspace = true }
 migration = { path = "../migration" }
 actix-web.workspace = true
 actix-files.workspace = true
@@ -60,6 +63,7 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 clap.workspace = true
 fsrs = "6.6.2"
+kokoro-micro = "1.3.0"
 
 [dev-dependencies]
 tempfile = "3"

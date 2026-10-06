@@ -20,6 +20,9 @@ const form = reactive({
   online_dict_sources: '',
   online_dict_enabled: false,
   random_browse_enabled: false,
+  tts_enabled: false,
+  tts_voice_zh: 'zf_xiaoni',
+  tts_voice_en: 'af_heart',
 })
 
 // 在线词典源开关。后端存 CSV（空 = 全部启用，向后兼容），界面用 checkbox 数组。
@@ -227,6 +230,35 @@ async function save() {
         </p>
       </section>
 
+      <section class="panel">
+        <h2>TTS 发音（kokoro）</h2>
+        <el-form-item>
+          <div class="switch-row">
+            <el-switch v-model="form.tts_enabled" />
+            <span>
+              {{
+                form.tts_enabled
+                  ? '已开启：词条无词典语音时，发音按钮显示「喇叭+T」并用本地模型合成'
+                  : '已禁用：词条只使用词典自带的语音（无语音则无发音按钮兜底）'
+              }}
+            </span>
+          </div>
+        </el-form-item>
+        <div class="lang-row">
+          <el-form-item label="中文嗓音">
+            <el-input v-model="form.tts_voice_zh" placeholder="zf_xiaoni" />
+          </el-form-item>
+          <el-form-item label="英文嗓音">
+            <el-input v-model="form.tts_voice_en" placeholder="af_heart" />
+          </el-form-item>
+        </div>
+        <p class="hint">
+          内嵌 Kokoro-82M（kokoro-micro）。首次使用会自动下载模型（约 337MB）到服务器的
+          ~/.cache/k/，下载与加载需要一点时间；之后结果按词缓存，重复播放零成本。
+          嗓音名决定语言（zf_*/zm_* 中文、af_*/bf_* 英语等九语内建）。
+        </p>
+      </section>
+
       <el-button type="primary" :loading="saving" @click="save">保存设置</el-button>
     </el-form>
   </div>
@@ -250,6 +282,12 @@ h1 {
   font-size: var(--text-xl);
   color: var(--color-text-primary);
   margin: 0;
+}
+
+.lang-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
 }
 
 .panel {

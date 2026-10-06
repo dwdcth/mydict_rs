@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import EntryFrame from './EntryFrame.vue'
 import FavoriteButton from './FavoriteButton.vue'
 import FlashcardButton from './FlashcardButton.vue'
+import WordAudioButton from './WordAudioButton.vue'
 import { favoriteKey } from '../composables/useFavorites'
 import { getEntryHtml, prefetchEntryHtml } from '../api/dict'
 import type { QueryResultItem } from '../types/query'
@@ -176,6 +177,13 @@ function isLoading(word: string, dictionaryId: number) {
       <span v-if="primary.lang_match === false" class="badge badge-warn">其他语言词典</span>
       <span v-if="hasMultiple" class="hint">共 {{ entries.length }} 条</span>
       <!-- 拦在外层而不是按钮上：禁用态按钮的点击在部分浏览器里仍会冒泡到标题栏 -->
+      <!-- 发音：词典语音优先，无则 TTS（喇叭+T） -->
+      <span @click.stop>
+        <WordAudioButton
+          :word="primary.word"
+          :dictionary-id="primary.dictionary_id"
+        />
+      </span>
       <span class="head-favorite" @click.stop @keydown.enter.stop @keydown.space.stop>
         <FavoriteButton
           :favorited="isFavorited(primary.word, primary.dictionary_id)"

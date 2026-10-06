@@ -1719,3 +1719,70 @@ async fn quiz_wordfreq_browse_wotd_anki() {
     assert!(tsv.contains("苹果"), "释义应为纯文本：{tsv}");
     assert!(!tsv.contains("<br>"), "HTML 应已剥除");
 }
+
+// ── TTS 与词典语音探测 ──────────────────────────────────────────
+
+#[actix_web::test]
+async fn word_audio_probe_and_tts_gate() {
+    let app = spawn_app().await;
+    let with_audio = seed_dictionary(
+        &app.state,
+        "带读音词典",
+        "en",
+        "en",
+        &[("apple", r#"<a href="sound://us/apple.mp3">🔊</a>n. 苹果"#)],
+    )
+    .await;
+    let without = seed_dictionary(
+        &app.state,
+        "无读音词典",
+        "zh-Hans",
+        "zh-Hans",
+        &[("苹果", "<p>一种水果</p>")],
+    )
+    .await;
+    let mut svc = init_service(&app.state).await;
+    let admin = admin_setup(&mut svc).await;
+    let req = actix_test::TestRequest::put()
+        .uri("/api/admin/settings")
+        .pipe_bearer(&admin)
+        .set_json(serde_json::json!({"open_access": true}))
+        .to_request();
+    assert!(actix_test::call_service(&mut svc, req).await.status().is_success());
+
+    // 有词典语音 → audio_url 指向 /dict-res
+    let probe: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri(&format!("/api/dict/audio?word=apple&dict={with_audio}"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        probe["audio_url"].as_str().unwrap(),
+        "/dict-res/{with_audio}/res/us/apple.mp3"
+    );
+
+    // 无词典语音 → null（前端转 TTS 兜底）
+    let probe: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri(&format!("/api/dict/audio?word=%E8%8B%B9%E6%9E%9C&dict={without}"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(probe["audio_url"], Value::Null);
+
+    // TTS 未启用 → 明确的服务状态消息（不触发模型下载）
+    let resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::get().uri("/api/dict/tts?word=apple").to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 500);
+    let body: Value = actix_test::call_and_read_body_json(&mut svc, TestRequest::get().uri("/api/dict/tts?word=apple").to_request()).await;
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("TTS 未启用"),
+        "{body:?}"
+    );
+}

@@ -162,6 +162,23 @@ export function getVocabEntryHtml(itemId: number) {
   return pending
 }
 
+/** 词条的词典语音地址（null = 词典无语音，前端转 TTS 兜底） */
+export function fetchWordAudio(word: string, dictionaryId: number) {
+  return request.get<never, { word: string; dictionary_id: number; audio_url: string | null }>(
+    '/dict/audio',
+    { params: { word, dict: dictionaryId } },
+  )
+}
+
+/** TTS 词语合成（kokoro-micro，WAV blob；首次合成 1-2 秒） */
+export function fetchTtsBlob(word: string, lang?: string) {
+  return request.get<BlobPart, BlobPart>('/dict/tts', {
+    params: { word, lang },
+    responseType: 'blob',
+    timeout: 60_000,
+  })
+}
+
 export function getQueryHistory() {
   return request.get<never, { items: QueryHistoryEntry[] }>('/dict/history')
 }

@@ -27,6 +27,7 @@ const BOOL_KEYS: &[&str] = &[
     "allow_registration",
     "online_dict_enabled",
     "random_browse_enabled",
+    "tts_enabled",
 ];
 const INT_KEYS: &[&str] = &[
     "token_default_daily_limit",
@@ -34,7 +35,13 @@ const INT_KEYS: &[&str] = &[
     "user_ip_rate_limit_per_min",
 ];
 const OPTIONAL_INT_KEYS: &[&str] = &["vocab_max_items_per_owner", "query_log_retention_days"];
-const STR_KEYS: &[&str] = &["site_name", "search_hint_text", "online_dict_sources"];
+const STR_KEYS: &[&str] = &[
+    "site_name",
+    "search_hint_text",
+    "online_dict_sources",
+    "tts_voice_zh",
+    "tts_voice_en",
+];
 
 const SEARCH_HINT_DEFAULT: &str = "小搜一下, 大进一步";
 
@@ -114,6 +121,10 @@ pub async fn get_all_settings(db: &DatabaseConnection, defaults: &Settings) -> R
         "search_hint_text": settings_service::get_setting(db, "search_hint_text", Some(SEARCH_HINT_DEFAULT)).await?,
         "online_dict_proxy": settings_service::get_setting(db, "online_dict_proxy", Some(&defaults.online_dict_proxy)).await?,
         "online_dict_sources": normalize_online_sources(settings_service::get_setting(db, "online_dict_sources", Some("")).await?.as_deref()),
+        // TTS（kokoro-micro 内嵌引擎）：默认关。开启后词条头部无词典语音时显示「喇叭+T」
+        "tts_enabled": settings_service::get_bool_setting(db, "tts_enabled", false).await?,
+        "tts_voice_zh": settings_service::get_setting(db, "tts_voice_zh", Some("zf_xiaoni")).await?,
+        "tts_voice_en": settings_service::get_setting(db, "tts_voice_en", Some("af_heart")).await?,
     }))
 }
 
