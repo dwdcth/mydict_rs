@@ -5,8 +5,10 @@ import { RefreshRight, Setting } from '@element-plus/icons-vue'
 import EntryFrame from '../components/EntryFrame.vue'
 import NavBar from '../components/NavBar.vue'
 import {
+  answerQuiz,
   deleteFlashcard,
   fetchFlashcardStats,
+  fetchQuiz,
   fetchReviewQueue,
   getFlashcardSettings,
   listFlashcards,
@@ -14,6 +16,7 @@ import {
   updateFlashcardSettings,
   type FlashcardQueueItem,
   type FlashcardStats,
+  type QuizQuestion,
 } from '../api/flashcards'
 import { getVocabEntryHtml } from '../api/dict'
 import { useUserAuthStore } from '../stores/userAuth'
@@ -111,6 +114,21 @@ function onKeydown(event: KeyboardEvent) {
   // 输入控件里不抢键
   const target = event.target as HTMLElement | null
   if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
+  if (mode.value === 'quiz') {
+    if (event.code === 'Space' || event.key === 'Enter') {
+      if (quizPicked.value !== null) {
+        event.preventDefault()
+        nextQuiz()
+      }
+      return
+    }
+    const idx = Number(event.key)
+    if (idx >= 1 && idx <= 4 && quizCurrent.value && quizPicked.value === null) {
+      event.preventDefault()
+      pickOption(idx - 1)
+    }
+    return
+  }
   if (event.code === 'Space' || event.key === 'Enter') {
     if (current.value && !revealed.value) {
       event.preventDefault()
@@ -175,6 +193,61 @@ async function saveSettings() {
   }
 }
 
+// ── 测验模式（例句挖空，4 选 1；答对=Good 答错=Again，测验即复习）──
+const mode = ref<'card' | 'quiz'>('card')
+const quiz = ref<QuizQuestion[]>([])
+const quizIndex = ref(0)
+const quizPicked = ref<number | null>(null)
+const quizLoading = ref(false)
+const quizCorrectCount = ref(0)
+
+const quizCurrent = computed(() => quiz.value[quizIndex.value] ?? null)
+
+async function loadQuiz() {
+  quizLoading.value = true
+  try {
+    const { questions } = await fetchQuiz(10)
+    quiz.value = questions
+    quizIndex.value = 0
+    quizPicked.value = null
+    quizCorrectCount.value = 0
+    if (questions.length === 0) {
+      import('element-plus').then(({ ElMessage }) =>
+        ElMessage.info('暂时出不了题：需要卡片释义里含英文例句（挖空测验面向英语学习）'),
+      )
+    }
+  } finally {
+    quizLoading.value = false
+  }
+}
+
+function switchMode(next: 'card' | 'quiz') {
+  mode.value = next
+  if (next === 'quiz' && quiz.value.length === 0) loadQuiz()
+}
+
+async function pickOption(index: number) {
+  const q = quizCurrent.value
+  if (!q || quizPicked.value !== null || quizLoading.value) return
+  quizPicked.value = index
+  const correct = index === q.correct_index
+  if (correct) quizCorrectCount.value += 1
+  // 走 FSRS（答对=Good 答错=Again）；失败不影响流程
+  answerQuiz(q.vocab_item_id, correct)
+    .then(() => loadStats().catch(() => undefined))
+    .catch(() => undefined)
+}
+
+function nextQuiz() {
+  if (quizIndex.value < quiz.value.length - 1) {
+    quizIndex.value += 1
+    quizPicked.value = null
+  } else {
+    // 本轮完成，重新取题（答过的卡按新 due 排序自然沉底）
+    loadQuiz()
+  }
+}
+
 // ── 卡片管理 ──
 async function openManage() {
   manageVisible.value = true
@@ -230,9 +303,14 @@ function dueLabel(dueAt: number) {
       <div class="review-header">
         <h1>复习</h1>
         <div class="review-actions">
-          <el-button text :loading="loading" @click="loadQueue()">
+          <el-radio-group :model-value="mode" size="small" @update:model-value="switchMode($event as 'card' | 'quiz')">
+            <el-radio-button value="card">翻卡</el-radio-button>
+            <el-radio-button value="quiz">选择题</el-radio-button>
+          </el-radio-group>
+          <el-button v-if="mode === 'card'" text :loading="loading" @click="loadQueue()">
             <el-icon><RefreshRight /></el-icon>刷新队列
           </el-button>
+          <el-button v-else text :loading="quizLoading" @click="loadQuiz()">重新出题</el-button>
           <el-button text @click="openManage">管理卡片</el-button>
           <el-button text @click="openSettings">
             <el-icon><Setting /></el-icon>参数
@@ -248,6 +326,45 @@ function dueLabel(dueAt: number) {
       </div>
 
       <div v-if="!authStore.isLoggedIn" class="gate">登录后开始复习</div>
+
+      <template v-else-if="mode === 'quiz'">
+        <div v-if="quizLoading" class="gate">出题中…</div>
+        <div v-else-if="!quizCurrent" class="done-card">
+          <p class="done-title">本模式需要释义里带英文例句</p>
+          <p class="done-hint">选择题从收藏的释义快照里抽例句挖空（面向英语学习）。</p>
+        </div>
+        <div v-else class="card quiz-card">
+          <div class="quiz-meta">
+            第 {{ quizIndex + 1 }}/{{ quiz.length }} 题 · 已对 {{ quizCorrectCount }}
+            <span v-if="quizCurrent.dictionary_name" class="quiz-dict">
+              出自 {{ quizCurrent.dictionary_name }}
+            </span>
+          </div>
+          <div class="quiz-sentence">{{ quizCurrent.sentence }}</div>
+          <div class="quiz-options">
+            <button
+              v-for="(option, index) in quizCurrent.options"
+              :key="index"
+              type="button"
+              class="quiz-option"
+              :class="{
+                correct: quizPicked !== null && index === quizCurrent.correct_index,
+                wrong: quizPicked === index && index !== quizCurrent.correct_index,
+              }"
+              :disabled="quizPicked !== null"
+              @click="pickOption(index)"
+            >
+              <span class="grade-key">{{ index + 1 }}</span>
+              {{ option }}
+            </button>
+          </div>
+          <div v-if="quizPicked !== null" class="quiz-next">
+            <el-button type="primary" @click="nextQuiz()">
+              下一题（空格）
+            </el-button>
+          </div>
+        </div>
+      </template>
 
       <template v-else>
         <div v-if="loading" class="gate">载入中…</div>
@@ -581,6 +698,69 @@ function dueLabel(dueAt: number) {
 .manage-reps {
   color: var(--color-text-tertiary);
   min-width: 44px;
+  text-align: right;
+}
+
+.quiz-card {
+  padding: var(--space-5) var(--space-4);
+}
+
+.quiz-meta {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-3);
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.quiz-dict {
+  margin-left: auto;
+}
+
+.quiz-sentence {
+  font-size: var(--text-lg);
+  line-height: 1.8;
+  color: var(--color-text-primary);
+  margin-bottom: var(--space-4);
+}
+
+.quiz-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-2);
+}
+
+.quiz-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+}
+
+.quiz-option:hover:not(:disabled) {
+  background: var(--color-hover-tint);
+}
+
+.quiz-option.correct {
+  border-color: var(--color-success, #67c23a);
+  background: rgba(103, 194, 58, 0.12);
+}
+
+.quiz-option.wrong {
+  border-color: var(--color-danger);
+  background: rgba(245, 108, 108, 0.12);
+}
+
+.quiz-next {
+  margin-top: var(--space-3);
   text-align: right;
 }
 

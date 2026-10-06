@@ -118,6 +118,69 @@ pub fn strip_legacy_file_prefix(relative: &str) -> String {
     FILE_PREFIX_RE.replace(relative, "").into_owned()
 }
 
+/// 极简 percent-decode（%XX，大小写十六进制均可）；无依赖，解码失败原样返回
+pub fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 资源引用的候选路径链（词典兼容容错）：
+/// 1. 原样
+/// 2. 多次 percent-decode（词典内容里被二次编码的 %23 等）
+/// 3. simplified/ 前缀与 `_simplified` 后缀变体（部分词典提供简繁两套资源）
+/// 依序尝试，先到先得；去重保序。
+pub fn resource_candidates(rel: &str) -> Vec<String> {
+    let mut out = vec![rel.to_string()];
+    // 多次解码（最多两轮，足够覆盖 %2523 → %23 → #）
+    let mut cur = rel.to_string();
+    for _ in 0..2 {
+        let next = percent_decode_lossy(&cur);
+        if next == cur {
+            break;
+        }
+        out.push(next.clone());
+        cur = next;
+    }
+    let base = out.clone();
+    for p in base {
+        let norm = p.replace('\\', "/");
+        let trimmed = norm.trim_start_matches('/');
+        if !trimmed.starts_with("simplified/") {
+            out.push(format!("simplified/{trimmed}"));
+        }
+        if let Some((stem, ext)) = trimmed.rsplit_once('.') {
+            if !stem.ends_with("_simplified") {
+                out.push(format!("{stem}_simplified.{ext}"));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.into_iter()
+        .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+        .collect()
+}
+
 /// 将资源内容写入 resource_dir/relative_path，自动创建父目录。
 ///
 /// overwrite=false 用于给**正在服务**的词典补文件：已存在的跳过，新文件走

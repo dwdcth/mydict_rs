@@ -17,6 +17,8 @@ pub mod entry_render;
 pub mod mdd_resources;
 pub mod mdx_resources;
 pub mod query_log;
+pub mod quiz;
+pub mod word_freq;
 pub mod rate_limit;
 pub mod web_rate_limit;
 pub mod spx;

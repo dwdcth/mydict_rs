@@ -38,6 +38,28 @@ fn dict_res_headers(mut resp: HttpResponse) -> HttpResponse {
     resp
 }
 
+/// mdd 查找走候选链（原样优先，未命中依次试解码/simplified 变体）；
+/// 首个命中的结果按**原始请求键**写入字节缓存，后续同键请求零查找
+async fn lookup_resource_with_candidates(
+    app: &std::sync::Arc<AppState>,
+    dictionary_id: i32,
+    normalized: &str,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some(hit) =
+        crate::services::mdd_resources::lookup_resource(app, dictionary_id, normalized).await
+    {
+        return Some(hit);
+    }
+    for candidate in res::resource_candidates(normalized).into_iter().skip(1) {
+        if let Some(hit) =
+            crate::services::mdd_resources::lookup_resource(app, dictionary_id, &candidate).await
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 pub async fn dict_resource(
     app: web::Data<std::sync::Arc<AppState>>,
     req: HttpRequest,
@@ -53,11 +75,30 @@ pub async fn dict_resource(
         .join(dictionary_id.to_string())
         .join("res");
 
-    // 1) 磁盘 res/（兄弟文件/历史解包/转码产物）：大小写不敏感解析放阻塞线程
+    // 外部样式空响应：词典里引用的 googleapis 在线字体/样式 CSS 拿不到也不该 404
+    // 刷屏（返回空 CSS，浏览器静默跳过）
+    let lower = normalized.to_lowercase();
+    if lower.contains("googleapis.") || lower == "googleapis.css" {
+        return dict_res_headers(
+            HttpResponse::Ok()
+                .content_type("text/css")
+                .body("/* external css not available offline */"),
+        );
+    }
+
+    // 1) 磁盘 res/（兄弟文件/历史解包/转码产物）：大小写不敏感解析放阻塞线程。
+    //    按候选链依次试：多次 percent-decode、simplified/ 前缀、_simplified 后缀
+    //    （词典兼容容错——部分词典引用与 mdd 键的编码/目录约定不一致）
+    let candidates = res::resource_candidates(&normalized);
     let res_dir2 = res_dir.clone();
-    let normalized2 = normalized.clone();
+    let candidates2 = candidates.clone();
     let disk_target = tokio::task::spawn_blocking(move || {
-        res::resolve_resource_file(&res_dir2, &normalized2)
+        for candidate in &candidates2 {
+            if let Some(target) = res::resolve_resource_file(&res_dir2, candidate) {
+                return Some(target);
+            }
+        }
+        None
     })
     .await
     .ok()
@@ -75,13 +116,9 @@ pub async fn dict_resource(
         };
     }
 
-    // 2) 直接从词典的 .mdd 按需读取（磁盘优化：不再导入期全量解包）
-    if let Some(bytes) = crate::services::mdd_resources::lookup_resource(
-        &app,
-        dictionary_id,
-        &normalized,
-    )
-    .await
+    // 2) 直接从词典的 .mdd 按需读取（磁盘优化：不再导入期全量解包）；
+    //    同样按候选链试（MddHandle 内部还有 basename/后缀兜底）
+    if let Some(bytes) = lookup_resource_with_candidates(&app, dictionary_id, &normalized).await
     {
         let media_type = res::resource_media_type(std::path::Path::new(&normalized));
         return dict_res_headers(
@@ -98,7 +135,7 @@ pub async fn dict_resource(
             Some(path) => Some(path),
             None => {
                 // 从 .mdd 读出 .spx 字节 → 唯一临时名（避免并发互踩）→ 转码
-                match crate::services::mdd_resources::lookup_resource(&app, dictionary_id, &spx_rel).await {
+                match lookup_resource_with_candidates(&app, dictionary_id, &spx_rel).await {
                     Some(bytes) => {
                         let res_dir = res_dir.clone();
                         match tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {

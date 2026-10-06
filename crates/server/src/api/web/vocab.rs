@@ -178,8 +178,58 @@ pub async fn entry(
         .body(doc))
 }
 
+/// GET /api/vocab/export —— 生词本导出 Anki 可导入的 TSV
+/// （word \t 释义纯文本 \t 来源词典 三列；文件分隔符导入手选 Tab）
+pub async fn export_anki(
+    app: web::Data<std::sync::Arc<AppState>>,
+    _req: HttpRequest,
+    user: UserAuth,
+) -> Result<HttpResponse, AppError> {
+    use sea_orm::ConnectionTrait;
+    let rows = app
+        .db
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            app.db.get_database_backend(),
+            "SELECT v.word, v.definition, d.name AS dictionary_name \
+             FROM vocab_items v LEFT JOIN dictionaries d ON d.id = v.dictionary_id \
+             WHERE v.user_id = $1 ORDER BY v.created_at DESC, v.id DESC",
+            [user.0.id.into()],
+        ))
+        .await
+        .map_err(AppError::from)?;
+    // Anki 导入不带头行（带反而要手动跳过）；三列：词 / 释义纯文本 / 来源
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let word = row.try_get::<String>("", "word").unwrap_or_default();
+        let definition = row.try_get::<Option<String>>("", "definition")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let source = row
+            .try_get::<Option<String>>("", "dictionary_name")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let plain = crate::services::query::html_to_plain_text(&definition);
+        // TSV 转义：制表/换行压成空格
+        let esc = |s: &str| -> String {
+            s.replace('\t', " ").replace('\r', " ").replace('\n', " ")
+        };
+        out.push(format!("{}\t{}\t{}", esc(&word), esc(&plain), esc(&source)));
+    }
+    let body = out.join("\n") + "\n";
+    Ok(HttpResponse::Ok()
+        .content_type("text/tab-separated-values; charset=utf-8")
+        .insert_header((
+            actix_web::http::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"vocab-anki.tsv\"",
+        ))
+        .body(body))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/vocab", web::get().to(list))
+        .route("/vocab/export", web::get().to(export_anki))
         .route("/vocab/languages", web::get().to(languages))
         .route("/vocab", web::post().to(add))
         .route("/vocab/{item_id}", web::delete().to(delete))

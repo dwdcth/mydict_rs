@@ -99,3 +99,28 @@ export function getFlashcardSettings() {
 export function updateFlashcardSettings(payload: { retention?: number; weights?: string }) {
   return request.put<never, FlashcardSettings>('/flashcards/settings', payload)
 }
+
+// ── 例句挖空测验 ─────────────────────────────────────────────
+
+export interface QuizQuestion {
+  vocab_item_id: number
+  sentence: string
+  blank_count: number
+  options: string[]
+  correct_index: number
+  dictionary_name: string | null
+}
+
+export function fetchQuiz(count = 10) {
+  return request.get<never, { questions: QuizQuestion[] }>('/flashcards/quiz', {
+    params: { count },
+  })
+}
+
+/** 答对=Good、答错=Again（走 FSRS，测验即复习） */
+export function answerQuiz(vocabItemId: number, correct: boolean) {
+  return request.post<never, { correct: boolean; interval_label: string }>(
+    `/flashcards/quiz/${vocabItemId}/answer`,
+    { correct },
+  )
+}

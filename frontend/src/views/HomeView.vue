@@ -13,6 +13,7 @@ import RandomDictPanel from '../components/RandomDictPanel.vue'
 import SkeletonList from '../components/SkeletonList.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { searchWord } from '../api/dict'
+import { wordOfTheDay } from '../api/learning'
 import { useFlashcards } from '../composables/useFlashcards'
 import { getSystemInfo } from '../api/system'
 import { useUserAuthStore } from '../stores/userAuth'
@@ -51,6 +52,17 @@ const {
 const MAX_LIVE_FRAMES = 5
 
 const word = ref('')
+const todayWord = ref<{ word: string; dictionary_name: string } | null>(null)
+
+/** 今日一词（日期种子，同日恒定）：空态区展示，点击即查 */
+async function loadTodayWord() {
+  try {
+    const t = await wordOfTheDay()
+    todayWord.value = { word: t.word, dictionary_name: t.dictionary_name }
+  } catch {
+    /* 静默 */
+  }
+}
 const submittedWord = ref('')
 const results = ref<QueryResultItem[]>([])
 const resultsRef = ref<HTMLElement | null>(null)
@@ -140,6 +152,7 @@ onMounted(async () => {
     loadFavorites().catch(() => undefined),
     authStore.isLoggedIn ? loadDictionaryFilter() : undefined,
     loadFlashcards().catch(() => undefined),
+    loadTodayWord().catch(() => undefined),
   ])
   // 词典列表与登录态都就绪了，这时才处理地址栏里的 ?q=（外链直达）
   await runFromUrl()
@@ -187,6 +200,13 @@ const activeTab = computed<string>(() => {
 function onSelectScope(scope: string) {
   onlineMode.value = false
   selectScope(scope)
+}
+
+/** 点今日一词：填入输入框并发起查询 */
+function queryTodayWord() {
+  if (!todayWord.value) return
+  word.value = todayWord.value.word
+  runSearch()
 }
 
 /** 点词典组：与语言标签同语义——一键切换勾选范围（在线模式退出、随机只换池子） */
@@ -605,6 +625,15 @@ function onRescroll(key: string) {
             @action="runSearch()"
           />
 
+          <!-- 空闲态：今日一词（日期种子，同日恒定）——给首页一点粘性 -->
+          <div v-else-if="status === 'idle' && todayWord" class="today-word">
+            <span class="today-label">今日一词</span>
+            <button type="button" class="today-word-btn" :title="`出自 ${todayWord.dictionary_name}，点击查询`" @click="queryTodayWord">
+              {{ todayWord.word }}
+            </button>
+            <span class="today-dict">{{ todayWord.dictionary_name }}</span>
+          </div>
+
           <EmptyState
             v-else-if="status === 'ok' && results.length === 0"
             :title="`暂未收录「${submittedWord}」，欢迎联系管理员补充词典`"
@@ -899,5 +928,34 @@ function onRescroll(key: string) {
   .scope-toggle {
     padding: var(--space-1) var(--space-2);
   }
+}
+.today-word {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-8) var(--space-4);
+  color: var(--color-text-tertiary);
+}
+
+.today-label {
+  font-size: var(--text-sm);
+}
+
+.today-word-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-brand-500);
+  font-size: 1.6rem;
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+}
+
+.today-word-btn:hover {
+  text-decoration: underline;
+}
+
+.today-dict {
+  font-size: var(--text-xs);
 }
 </style>

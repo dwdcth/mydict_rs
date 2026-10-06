@@ -31,8 +31,14 @@ pub struct MddResources {
 
 struct MddHandle {
     file: MddFile,
-    /// 归一化键（小写正斜杠）→ 原始键；首次大小写兜底时构建
-    lower_map: OnceLock<HashMap<String, String>>,
+    /// 归一化键索引（小写正斜杠 → 原始键）与 basename 索引（小写文件名 → 原始键），
+    /// 首次大小写/basename 兜底时一并构建
+    key_maps: OnceLock<KeyMaps>,
+}
+
+struct KeyMaps {
+    lower: HashMap<String, String>,
+    basename: HashMap<String, String>,
 }
 
 impl MddResources {
@@ -69,7 +75,7 @@ impl MddHandle {
         let file = MddFile::open_with_options(path, &options)?;
         Ok(Self {
             file,
-            lower_map: OnceLock::new(),
+            key_maps: OnceLock::new(),
         })
     }
 
@@ -86,22 +92,52 @@ impl MddHandle {
                 return Some(resource.bytes().to_vec());
             }
         }
-        // 大小写兜底：构建归一化映射
-        let map = self.lower_map.get_or_init(|| {
-            let mut map = HashMap::new();
+        // 大小写兜底（归一化映射）
+        let maps = self.maps();
+        let normalized = normalize_key(rel_path);
+        if let Some(exact) = maps.lower.get(&normalized) {
+            if let Some(resource) = self.file.lookup(exact).ok().flatten() {
+                return Some(resource.bytes().to_vec());
+            }
+        }
+        // basename 兜底：词典内引用常带与 mdd 不同的目录前缀，只要文件名能对上
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized).to_string();
+        if let Some(key) = maps.basename.get(&basename) {
+            if let Some(resource) = self.file.lookup(key).ok().flatten() {
+                return Some(resource.bytes().to_vec());
+            }
+        }
+        // 后缀包含兜底：引用路径是 mdd 键的后缀（键多出数字 ID 前缀目录等）
+        let suffix = format!("/{normalized}");
+        if let Some(key) = maps
+            .lower
+            .values()
+            .find(|k| normalize_key(k).ends_with(&suffix))
+        {
+            if let Some(resource) = self.file.lookup(key).ok().flatten() {
+                return Some(resource.bytes().to_vec());
+            }
+        }
+        None
+    }
+
+    /// 大小写归一化与 basename 双索引（一次遍历建好，OnceLock 保证只建一次）
+    fn maps(&self) -> &KeyMaps {
+        self.key_maps.get_or_init(|| {
+            let mut lower = HashMap::new();
+            let mut basename: HashMap<String, String> = HashMap::new();
             for key in self.file.keys().flatten() {
                 let owned = key.key().to_string();
-                map.entry(normalize_key(&owned)).or_insert(owned);
+                let norm = normalize_key(&owned);
+                if let Some(name) = norm.rsplit('/').next() {
+                    basename.entry(name.to_string()).or_insert_with(|| owned.clone());
+                }
+                lower.entry(norm).or_insert(owned);
             }
-            map
-        });
-        let exact = map.get(&normalize_key(rel_path))?;
-        self.file
-            .lookup(exact)
-            .ok()
-            .flatten()
-            .map(|r| r.bytes().to_vec())
+            KeyMaps { lower, basename }
+        })
     }
+
 }
 
 /// 某词典的全部 .mdd 源文件（按导入时的 position 保序；含分卷 .1.mdd 等）
@@ -199,19 +235,36 @@ pub async fn same_name_assets_with_mdd(
     if stem.is_empty() {
         return assets;
     }
-    for extension in [".css", ".js"] {
-        let name = format!("{stem}{extension}");
-        if assets.iter().any(|(n, _)| *n == name) {
+    // 候选名链：同名 css/js 之外，还有词典内置路由名（__style.css 等）与
+    // jquery 伴生变体（OALD 类词典的交互按钮依赖 {名}-jquery.js / jquery.js）。
+    // css/js 各注入**首个命中**的一个（与既有 same_name_assets 的语义一致）
+    let css_candidates = [format!("{stem}.css"), "__style.css".to_string()];
+    let js_candidates = [
+        format!("{stem}.js"),
+        format!("{stem}-jquery.js"),
+        "jquery.js".to_string(),
+        "__script.js".to_string(),
+        "__jquery.js".to_string(),
+    ];
+    let groups: [(Vec<String>, &str); 2] = [
+        (css_candidates.to_vec(), ".css"),
+        (js_candidates.to_vec(), ".js"),
+    ];
+    for (candidates, extension) in groups {
+        if assets.iter().any(|(n, _)| n.ends_with(extension)) {
             continue;
         }
-        if resource_exists(state, dictionary_id, &name).await {
-            assets.push((
-                name.clone(),
-                format!(
-                    "/dict-res/{dictionary_id}/res/{}",
-                    dict_parser::resources::quote_path_pub(&name)
-                ),
-            ));
+        for name in candidates {
+            if resource_exists(state, dictionary_id, &name).await {
+                assets.push((
+                    name.clone(),
+                    format!(
+                        "/dict-res/{dictionary_id}/res/{}",
+                        dict_parser::resources::quote_path_pub(&name)
+                    ),
+                ));
+                break;
+            }
         }
     }
     assets

@@ -21,6 +21,17 @@ const router = createRouter({
       meta: { requiresUser: true },
     },
     {
+      path: '/analyze',
+      name: 'analyze',
+      component: () => import('../views/AnalyzerView.vue'),
+    },
+    {
+      path: '/browse',
+      name: 'browse',
+      component: () => import('../views/BrowseView.vue'),
+      meta: { requiresUser: true },
+    },
+    {
       path: '/history',
       name: 'history',
       component: () => import('../views/HistoryView.vue'),

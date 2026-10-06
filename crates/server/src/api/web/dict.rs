@@ -260,9 +260,115 @@ pub async fn history(
     Ok(web::Json(json!({"items": items})))
 }
 
+/// GET /api/dict/word-of-the-day —— 今日一词（日期种子确定性取样，同日恒定）
+pub async fn word_of_the_day(
+    app: web::Data<std::sync::Arc<AppState>>,
+    req: HttpRequest,
+) -> Result<web::Json<Value>, AppError> {
+    let caller = get_web_caller(&req, &app).await?;
+    let allowed = crate::core::deps::caller_allowed_ids(&app, caller.user.as_ref()).await?;
+    use sea_orm::ConnectionTrait;
+
+    // 干净词头过滤（对齐浏览模式）：2-50 字符；含数字的词在 Rust 侧跳过
+    // （GLOB 是 SQLite 方言，多库兼容起见不做 SQL 侧字符类过滤）
+    let clean = "length(e.word) BETWEEN 2 AND 50";
+    let (where_allowed, values_allowed): (String, Vec<sea_orm::Value>) = match &allowed {
+        Some(ids) if !ids.is_empty() => {
+            let backend = app.db.get_database_backend();
+            let ph = crate::services::query::sql_placeholders(backend, ids.len());
+            (
+                format!(" AND e.dictionary_id IN ({ph})"),
+                ids.iter().map(|id| (*id).into()).collect(),
+            )
+        }
+        Some(_) => (" AND 0".to_string(), Vec::new()),
+        None => (String::new(), Vec::new()),
+    };
+
+    // 日期种子：MD5(本地日期) 取前 8 hex → u64（同日所有请求同值，跨日自动换）
+    let zone = crate::core::timeutil::local_zone(&app.cfg.timezone);
+    let today = crate::core::timeutil::today_str(zone);
+    let digest = md5_like_seed(&today);
+    let backend = app.db.get_database_backend();
+
+    // 落点 = 种子 % 主键跨度，向后找第一条合格词；到尾则回头
+    let bounds = app
+        .db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            backend,
+            &format!(
+                "SELECT MIN(e.id) AS lo, MAX(e.id) AS hi FROM dict_entries e \
+                 JOIN dictionaries d ON e.dictionary_id = d.id AND e.generation = d.active_generation \
+                 WHERE d.status = 'enabled'{where_allowed}"
+            ),
+            values_allowed.clone(),
+        ))
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("没有可用的词典"))?;
+    let (lo, hi) = (
+        bounds.try_get::<Option<i64>>("", "lo").ok().flatten(),
+        bounds.try_get::<Option<i64>>("", "hi").ok().flatten(),
+    );
+    let (Some(lo), Some(hi)) = (lo, hi) else {
+        return Err(AppError::not_found("没有可用的词条"));
+    };
+    let span = (hi - lo + 1).max(1);
+    let landing = lo + (digest % span as u64) as i64;
+
+    let sql = format!(
+        "SELECT e.word, e.dictionary_id, d.name AS dictionary_name FROM dict_entries e \
+         JOIN dictionaries d ON e.dictionary_id = d.id AND e.generation = d.active_generation \
+         WHERE d.status = 'enabled' AND {clean}{where_allowed} AND e.id >= $1 \
+         ORDER BY e.id LIMIT 20"
+    );
+    let pick_rows = |id: i64| -> Vec<sea_orm::QueryResult> {
+        let mut values = vec![id.into()];
+        values.extend(values_allowed.clone());
+        let stmt = sea_orm::Statement::from_sql_and_values(backend, &sql, values);
+        futures::executor::block_on(app.db.query_all_raw(stmt))
+            .unwrap_or_default()
+    };
+    // 落点向后最多看 20 条，跳过含数字的词头；落点太靠尾（后面全不干净）就环绕回开头再找
+    fn clean_of(rows: &[sea_orm::QueryResult]) -> Option<&sea_orm::QueryResult> {
+        rows.iter().find(|r| {
+            let w = r.try_get::<String>("", "word").unwrap_or_default();
+            !w.chars().any(|c| c.is_ascii_digit())
+        })
+    }
+    let mut rows = pick_rows(landing);
+    let mut row = clean_of(&rows);
+    if row.is_none() {
+        // 落点在尾部且后面全不干净 → 环绕回开头
+        rows = pick_rows(lo);
+        row = clean_of(&rows);
+    }
+    let row = row.or_else(|| rows.first());
+    let Some(row) = row else {
+        return Err(AppError::not_found("没有可用的词条"));
+    };
+    Ok(web::Json(json!({
+        "word": row.try_get::<String>("", "word").unwrap_or_default(),
+        "dictionary_id": row.try_get::<i32>("", "dictionary_id").unwrap_or_default(),
+        "dictionary_name": row.try_get::<String>("", "dictionary_name").unwrap_or_default(),
+        "date": today,
+    })))
+}
+
+/// 日期串 → 稳定散列种子（FNV-1a 64：无依赖、分布足够）
+fn md5_like_seed(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in input.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/dict/dictionaries", web::get().to(dictionaries))
         .route("/dict/search", web::get().to(search))
         .route("/dict/entry/{dictionary_id}", web::get().to(entry))
-        .route("/dict/history", web::get().to(history));
+        .route("/dict/history", web::get().to(history))
+        .route("/dict/word-of-the-day", web::get().to(word_of_the_day));
 }

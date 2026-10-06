@@ -87,6 +87,8 @@ async function saveAllowedDictionaries(ids: number[] | null) {
       <router-link to="/review" active-class="active" @click="refreshDueBadge">
         复习<span v-if="dueCount > 0" class="due-badge">{{ dueCount > 99 ? '99+' : dueCount }}</span>
       </router-link>
+      <router-link v-if="authStore.isLoggedIn" to="/analyze" active-class="active">词频</router-link>
+      <router-link v-if="authStore.isLoggedIn" to="/browse" active-class="active">浏览</router-link>
       <router-link to="/history" active-class="active">历史</router-link>
     </nav>
 

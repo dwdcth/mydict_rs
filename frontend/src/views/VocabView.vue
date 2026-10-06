@@ -3,6 +3,7 @@ import { onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import NavBar from '../components/NavBar.vue'
+import { downloadAnkiExport } from '../api/learning'
 import VocabCompactCard from '../components/VocabCompactCard.vue'
 import SkeletonList from '../components/SkeletonList.vue'
 import EmptyState from '../components/EmptyState.vue'
@@ -123,6 +124,9 @@ async function remove(item: VocabItem) {
       <div class="header">
         <div class="title-group">
           <h1>我的生词本</h1>
+          <button type="button" class="sort-btn" title="导出 Anki 可导入的 TSV（词/释义/来源三列）" @click="downloadAnkiExport()">
+            导出 Anki
+          </button>
           <button
             v-for="opt in sortOptions"
             :key="opt.key"

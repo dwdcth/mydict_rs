@@ -1563,3 +1563,159 @@ async fn flashcards_fsrs_full_flow() {
         .iter()
         .all(|item| item["in_review"] == false));
 }
+
+// ── 吸收自 PythonMDict 的学习/兼容功能 ──────────────────────────
+
+#[actix_web::test]
+async fn quiz_wordfreq_browse_wotd_anki() {
+    let app = spawn_app().await;
+    // 释义带英文例句（quiz 要能挖空）
+    let dict_id = seed_dictionary(
+        &app.state,
+        "学习词典",
+        "en",
+        "en",
+        &[
+            ("apple", "n. 苹果<br>The apple is a sweet fruit that grows on trees."),
+            ("apply", "v. 申请<br>She wants to apply for the job before Friday."),
+            ("apricot", "n. 杏<br>An apricot is a small orange fruit."),
+            ("banana", "n. 香蕉<br>The banana turned brown quickly."),
+            ("bandana", "n. 头巾"),
+            ("123", "数字词头"),
+            ("a", "x"),
+        ],
+    )
+    .await;
+    let mut svc = init_service(&app.state).await;
+    let _: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/auth/register")
+            .set_json(serde_json::json!({
+                "username": "learner", "password": "password123", "email": "l@t.dev"
+            }))
+            .to_request(),
+    )
+    .await;
+    let login: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/auth/login")
+            .set_json(serde_json::json!({"username": "learner", "password": "password123"}))
+            .to_request(),
+    )
+    .await;
+    let token = login["access_token"].as_str().unwrap().to_string();
+
+    // ── 例句挖空测验 ──
+    let added: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/flashcards")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"word": "apple", "dictionary_id": dict_id}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(added["already"], false);
+    let quiz: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/flashcards/quiz").pipe_bearer(&token).to_request(),
+    )
+    .await;
+    let questions = quiz["questions"].as_array().expect("questions");
+    assert!(!questions.is_empty(), "apple 卡应能出题：{quiz:?}");
+    let q = &questions[0];
+    assert!(q["sentence"].as_str().unwrap().contains("____"), "{q:?}");
+    assert!(!q["sentence"].as_str().unwrap().to_lowercase().contains("apple"), "句子里不该残留答案");
+    assert_eq!(q["options"].as_array().unwrap().len(), 4);
+    assert!(q["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o.as_str().unwrap().eq_ignore_ascii_case("apple")));
+    let item_id = q["vocab_item_id"].as_i64().unwrap();
+    let correct = q["correct_index"].as_i64().unwrap();
+    let ans: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri(&format!("/api/flashcards/quiz/{item_id}/answer"))
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"correct": true}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(ans["correct"], true);
+    assert!(ans["interval_days"].as_i64().unwrap_or(0) >= 1, "答对=Good 应排期：{ans:?}");
+
+    // ── 词频分析 ──
+    let freq: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/tools/word-frequency")
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"text": "The apple and the banana. Apple pie! She went to the apple tree."}))
+            .to_request(),
+    )
+    .await;
+    let words = freq["words"].as_array().unwrap_or_else(|| panic!("词频响应异常：{freq:?}"));
+    assert!(freq["total_tokens"].as_i64().unwrap() > 0);
+    // apple 3 次居首；the/and/she 等停用词被滤掉
+    assert_eq!(words[0]["word"], "apple");
+    assert_eq!(words[0]["count"], 3);
+    assert!(words.iter().all(|w| w["word"].as_str().unwrap() != "the"));
+    // in_dict：apple/banana 已收录
+    let apple = words.iter().find(|w| w["word"] == "apple").unwrap();
+    assert_eq!(apple["in_dict"], true);
+
+    // ── 词条浏览（干净词头过滤 + 游标分页）──
+    let page1_resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::get().uri(&format!("/api/tools/dict/browse/{dict_id}?limit=3"))
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    let page1_body = actix_test::read_body(page1_resp).await;
+    let page1: Value = serde_json::from_slice(&page1_body)
+        .unwrap_or_else(|e| panic!("browse 响应异常：{e} body={}", String::from_utf8_lossy(&page1_body)));
+    let browsed: Vec<&str> = page1["words"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+    assert_eq!(browsed, vec!["apple", "apply", "apricot"], "按序且过滤了脏词头：{browsed:?}");
+    assert!(page1["next_cursor"].is_string());
+    let page2: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri(&format!("/api/tools/dict/browse/{dict_id}?limit=3&after={}", page1["next_cursor"].as_str().unwrap()))
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(page2["words"].as_array().unwrap()[0], "banana");
+
+    // ── 每日一词：同日恒定、词头干净 ──
+    let w1_resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::get().uri("/api/dict/word-of-the-day").pipe_bearer(&token).to_request(),
+    ).await;
+    let w1_body = actix_test::read_body(w1_resp).await;
+    let w1: Value = serde_json::from_slice(&w1_body)
+        .unwrap_or_else(|e| panic!("wotd 响应异常：{e} body={}", String::from_utf8_lossy(&w1_body)));
+    let w2: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get().uri("/api/dict/word-of-the-day").pipe_bearer(&token).to_request(),
+    ).await;
+    assert_eq!(w1["word"], w2["word"], "同日应恒定：{w1:?} vs {w2:?}");
+    assert!(!w1["word"].as_str().unwrap().is_empty());
+
+    // ── Anki 导出 ──
+    let resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::get().uri("/api/vocab/export").pipe_bearer(&token).to_request(),
+    ).await;
+    assert!(resp.status().is_success());
+    let body = actix_test::read_body(resp).await;
+    let tsv = String::from_utf8_lossy(&body);
+    assert!(tsv.contains("apple\t"), "TSV 应含词列：{tsv}");
+    assert!(tsv.contains("苹果"), "释义应为纯文本：{tsv}");
+    assert!(!tsv.contains("<br>"), "HTML 应已剥除");
+}

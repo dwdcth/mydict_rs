@@ -153,12 +153,54 @@ pub async fn update_settings(
     ))
 }
 
+#[derive(Deserialize)]
+pub struct QuizQuery {
+    #[serde(default = "default_quiz_count")]
+    pub count: i64,
+}
+
+fn default_quiz_count() -> i64 {
+    10
+}
+
+#[derive(Deserialize)]
+pub struct QuizAnswerRequest {
+    pub correct: bool,
+}
+
+/// GET /api/flashcards/quiz —— 例句挖空测验（到期卡优先；答对/答错映射 FSRS Good/Again）
+pub async fn quiz(
+    app: web::Data<std::sync::Arc<AppState>>,
+    _req: HttpRequest,
+    query: web::Query<QuizQuery>,
+    user: UserAuth,
+) -> Result<web::Json<serde_json::Value>, AppError> {
+    let count = query.count.clamp(1, 30);
+    Ok(web::Json(
+        crate::services::quiz::build_quiz(&app, user.0.id, count).await?,
+    ))
+}
+
+/// POST /api/flashcards/quiz/{vocab_item_id}/answer —— 答对=Good、答错=Again
+pub async fn quiz_answer(
+    app: web::Data<std::sync::Arc<AppState>>,
+    path: web::Path<i32>,
+    body: web::Json<QuizAnswerRequest>,
+    user: UserAuth,
+) -> Result<web::Json<serde_json::Value>, AppError> {
+    Ok(web::Json(
+        crate::services::quiz::answer(&app, user.0.id, path.into_inner(), body.correct).await?,
+    ))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/flashcards")
             .route("", web::get().to(list))
             .route("", web::post().to(add_card))
             .route("/queue", web::get().to(queue))
+            .route("/quiz", web::get().to(quiz))
+            .route("/quiz/{vocab_item_id}/answer", web::post().to(quiz_answer))
             .route("/stats", web::get().to(stats))
             .route("/settings", web::get().to(get_settings))
             .route("/settings", web::put().to(update_settings))
