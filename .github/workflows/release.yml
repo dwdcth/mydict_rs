@@ -80,7 +80,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-v2
 
       - name: Install archive tool (Windows)
         if: runner.os == 'Windows'
@@ -117,7 +117,23 @@ jobs:
           cargo clean -p ort-sys || true
 
       - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }} -p server
+        run: |
+          set -o pipefail
+          cargo build --release --target ${{ matrix.target }} -p server -vv 2>&1 | tee build.log | tail -3
+
+      # 垫片是否真的链上（曾发生 ort-sys 缓存导致垫片被静默跳过、产物要
+      # glibc 2.38 的事故）：isoc23 符号必须已静态解析，否则直接判失败
+      - name: Verify shim linked
+        if: matrix.ort_shim
+        run: |
+          echo "── 构建日志里的链接指令 ──"
+          grep -E "isoc23shim|rustc-link-lib.*onnxruntime|rustc-link-search.*onnxruntime-123" build.log | sort -u | head -10 || true
+          echo "── 二进制动态符号检查 ──"
+          if objdump -T "target/${{ matrix.target }}/release/mydict" | grep -E "__isoc23.*UND"; then
+            echo "::error::__isoc23_* 仍未静态解析，产物会要求 glibc>=2.38"
+            exit 1
+          fi
+          echo "isoc23 已静态解析 ✓（GLIBC 上限 2.34）"
 
       - uses: actions/download-artifact@v4
         with:
