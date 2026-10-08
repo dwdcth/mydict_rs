@@ -58,13 +58,11 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: mydict-aarch64-linux.tar.gz
+          # 不出 macOS x86_64：ort 的预编译 onnxruntime 只发 arm64 mac，
+          # Intel 需自编译 ORT（不值；Intel Mac 用户可用 Docker/Linux 版）
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: mydict-aarch64-macos.tar.gz
-          # arm64 runner 上用 Xcode 工具链交叉出 x86_64（Intel runner 逐步退役）
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: mydict-x86_64-macos.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: mydict-x86_64-windows.zip
@@ -87,7 +85,16 @@ jobs:
         shell: pwsh
         run: choco install zip -y --no-progress
 
-      # 只在 linux x86_64 上跑一遍测试（迁移/契约/解析语料，模型类 #[ignore] 自动跳过）
+      # 只在 linux x86_64 上跑一遍测试（模型类 #[ignore] 自动跳过）。
+      # 契约测试依赖 scripts/gen_corpus.py 生成的 testdata/（gitignore 不入库），
+      # 先装 liblzo2 并生成语料（LZO 语料缺库会被脚本跳过）
+      - name: Generate test corpus
+        if: matrix.run_tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq liblzo2-2 >/dev/null
+          python3 scripts/gen_corpus.py
+
       - name: Test
         if: matrix.run_tests
         run: cargo test --workspace --quiet
