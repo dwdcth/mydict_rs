@@ -123,15 +123,17 @@ jobs:
           cargo build --release --target ${{ matrix.target }} -p server -vv 2>&1 | tee build.log | tail -3
 
       # 垫片是否真的链上（曾发生 ort-sys 缓存导致垫片被静默跳过、产物要
-      # glibc 2.38 的事故）：isoc23 符号必须已静态解析，否则直接判失败
+      # glibc 2.38 的事故）：isoc23 符号必须已静态解析，否则直接判失败。
+      # 注意 objdump 输出里 UND 在符号名**前面**，两次 grep 分开做
       - name: Verify shim linked
         if: matrix.ort_shim
         run: |
           echo "── 构建日志里的链接指令 ──"
           grep -E "isoc23shim|rustc-link-lib.*onnxruntime|rustc-link-search.*onnxruntime-123" build.log | sort -u | head -10 || true
           echo "── 二进制动态符号检查 ──"
-          if objdump -T "target/${{ matrix.target }}/release/mydict" | grep -E "__isoc23.*UND"; then
+          if objdump -T "target/${{ matrix.target }}/release/mydict" | grep "__isoc23" | grep -q "UND"; then
             echo "::error::__isoc23_* 仍未静态解析，产物会要求 glibc>=2.38"
+            objdump -T "target/${{ matrix.target }}/release/mydict" | grep "__isoc23"
             exit 1
           fi
           echo "isoc23 已静态解析 ✓（GLIBC 上限 2.34）"
