@@ -25,6 +25,9 @@ pub fn start(state: &Arc<AppState>) {
                     if let Err(err) = aggregate_current(&state).await {
                         tracing::error!(error = %err, "统计聚合失败");
                     }
+                    // 空闲内存回收：关闭超过 DICT_IDLE_UNLOAD_SECS 未查询的词典句柄，
+                    // 释放资源/音频缓存里的过期项（空闲期无读写，moka 维护不会自己跑）
+                    state.release_idle_memory();
                 }
                 _ = day_ticker.tick() => {
                     if let Err(err) = cleanup_query_logs(&state).await {

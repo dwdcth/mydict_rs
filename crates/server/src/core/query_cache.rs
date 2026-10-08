@@ -1,6 +1,7 @@
 //! 查询结果缓存 —— 移植自 `app/core/query_cache.py`。
 //!
-//! 进程内 TTL 缓存（300s / 10k 条），key = word_lower|候选词典集合|x{版本}|d?|a?。
+//! 进程内 TTL 缓存（300s / 64MB，按序列化后体积计重——大结果会挤掉小结果，
+//! 词典多、释义大时内存有界），key = word_lower|候选词典集合|x{版本}|d?|a?。
 //! 词典启停/导入/删除/改名/语言变更 → 全量失效。
 
 use std::sync::Arc;
@@ -13,6 +14,11 @@ use serde_json::Value;
 /// （Python EXPANSION_VERSION=2）
 pub const EXPANSION_VERSION: i32 = 2;
 
+/// 查询结果缓存字节预算（结果含整页释义 HTML，必须按体积计重）
+const QUERY_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// 词条文档缓存字节预算
+const DOC_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct QueryCache {
     inner: MokaCache<String, Arc<Value>>,
     /// 词条文档 HTML 的短 TTL 缓存（图片版词典一份文档 35KB+，渲染含物化与
@@ -20,15 +26,44 @@ pub struct QueryCache {
     docs: MokaCache<String, Arc<String>>,
 }
 
+/// JSON 值的内存粗估：每节点 16B 开销 + 字符串按字节 + String 头 24B。
+/// 只用于缓存计重，量级对即可。
+fn json_weight(value: &Value) -> u64 {
+    fn walk(value: &Value, acc: &mut u64) {
+        match value {
+            Value::String(s) => *acc += 24 + s.len() as u64 + 16,
+            Value::Array(items) => {
+                *acc += 16 + 8 * items.len() as u64;
+                for item in items {
+                    walk(item, acc);
+                }
+            }
+            Value::Object(map) => {
+                *acc += 16 + 24 * map.len() as u64;
+                for (k, v) in map {
+                    *acc += 24 + k.len() as u64;
+                    walk(v, acc);
+                }
+            }
+            _ => *acc += 24, // number/bool/null 定长
+        }
+    }
+    let mut acc = 0u64;
+    walk(value, &mut acc);
+    acc
+}
+
 impl QueryCache {
     pub fn new() -> Self {
         Self {
             inner: MokaCache::builder()
-                .max_capacity(10_000)
+                .max_capacity(QUERY_CACHE_BYTES as u64)
+                .weigher(|_k, v: &Arc<Value>| json_weight(v).min(u32::MAX as u64) as u32)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
             docs: MokaCache::builder()
-                .max_capacity(256)
+                .max_capacity(DOC_CACHE_BYTES as u64)
+                .weigher(|_k, v: &Arc<String>| v.len() as u32)
                 .time_to_live(Duration::from_secs(120))
                 .build(),
         }
@@ -73,5 +108,33 @@ impl QueryCache {
     pub fn invalidate(&self) {
         self.docs.invalidate_all();
         self.inner.invalidate_all();
+    }
+
+    /// 触发 moka 维护任务：真正释放过期条目占的内存（调度器周期调用）
+    pub fn run_maintenance(&self) {
+        self.inner.run_pending_tasks();
+        self.docs.run_pending_tasks();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_weight_scales_with_content() {
+        let small = serde_json::json!({"a": 1});
+        let apple = "apple".repeat(1000);
+        let banana = "banana".repeat(1000);
+        let big = serde_json::json!({
+            "entries": [
+                {"word": "苹果", "definition": apple},
+                {"word": "香蕉", "definition": banana},
+            ]
+        });
+        let ws = json_weight(&small);
+        let wb = json_weight(&big);
+        assert!(ws < 200, "小对象估算应很小：{ws}");
+        assert!(wb > 2000, "大对象估算应随内容增长：{wb}");
     }
 }

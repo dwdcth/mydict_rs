@@ -37,6 +37,15 @@ pub struct Settings {
 
     /// 在线词典出站抓取（维基百科/维基词典）用的 HTTP 代理，留空直连；管理后台可覆盖
     pub online_dict_proxy: String,
+
+    /// .mdd 句柄缓存（词头索引常驻内存）的容量预算，按 mdictlib memory_usage 实测字节计重。
+    /// 对齐 GoldenDict/MDict 的「按需打开 + 限量常驻」：预算内 LRU 常驻，超了淘汰最久未用
+    pub dict_mdd_handle_budget_mb: usize,
+    /// lite 词典解析器句柄（mdx 词头索引）缓存的容量预算，按词条数 × 32B 估算计重
+    pub dict_mdx_handle_budget_mb: usize,
+    /// 词典句柄/资源缓存的空闲回收秒数：超过此时长未被查询的词典关闭并释放内存
+    /// （下次查询重新打开，毫秒到秒级；GoldenDict 靠手动分组，服务端用空闲超时自动做）
+    pub dict_idle_unload_secs: u64,
 }
 
 fn env_str(key: &str, default: &str) -> String {
@@ -99,6 +108,10 @@ fn env_usize(key: &str, default: usize) -> usize {
     env_value(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    env_value(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// 0 = 自动：核数一半、封顶 4（CPU 留余量，多词典导入也不叠满核）
 fn effective_import_workers(configured: usize) -> usize {
     if configured > 0 {
@@ -137,6 +150,9 @@ impl Settings {
             log_dir: env_str("LOG_DIR", "/data/logs"),
             static_dir: env_str("STATIC_DIR", "static"),
             online_dict_proxy: env_str("ONLINE_DICT_PROXY", ""),
+            dict_mdd_handle_budget_mb: env_usize("DICT_MDD_HANDLE_BUDGET_MB", 384),
+            dict_mdx_handle_budget_mb: env_usize("DICT_MDX_HANDLE_BUDGET_MB", 384),
+            dict_idle_unload_secs: env_u64("DICT_IDLE_UNLOAD_SECS", 1800),
         };
         settings.import_workers = effective_import_workers(settings.import_workers);
         settings

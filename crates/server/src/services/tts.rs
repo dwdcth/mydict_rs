@@ -209,8 +209,15 @@ impl TtsState {
             audio: MokaCache::builder()
                 .max_capacity(TTS_CACHE_BYTES as u64)
                 .weigher(|_k, v: &Arc<SynthAudio>| v.bytes.len() as u32)
+                // 空闲回收：长期没播放的音频释放掉（热词不受影响）
+                .time_to_idle(std::time::Duration::from_secs(3600))
                 .build(),
         }
+    }
+
+    /// 触发 moka 维护任务：真正释放空闲过期音频占的内存（调度器周期调用）
+    pub fn run_maintenance(&self) {
+        self.audio.run_pending_tasks();
     }
 }
 

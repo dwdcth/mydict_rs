@@ -1,28 +1,34 @@
 //! 运行期直接从 .mdd 按需读取资源 —— 替代导入期全量解包的磁盘优化。
 //!
 //! mdictlib 的 MddFile 支持单资源随机访问（只解压所在块），配合进程内：
-//! - 句柄缓存（每部 .mdd 打开一次，key 索引常驻）
+//! - 句柄缓存（**按字节预算** LRU：打开时强制构建词头索引并读取
+//!   mdictlib `memory_usage()` 实测占用计重；GoldenDict 靠分组限量，服务端用预算 + 空闲超时）
+//! - 空闲回收（`time_to_idle`：DICT_IDLE_UNLOAD_SECS 未被查询的 .mdd 关闭句柄释放内存，
+//!   下次查询重新打开——索引构建本来就在首个请求时付过一次）
 //! - 归一化键映射（mdd 键是 Windows 风格 `\dir\file.png` 且大小写不定，请求路径
-//!   统一归一成小写正斜杠后映射回原始键；仅在精确查找未命中时才构建）
-//! - 字节缓存（256MB 上限，按字节计重；词条整页图片这类热资源命中后零解压）
+//!   统一归一成小写正斜杠后映射回**物理序号**（KeyOrdinal 直读，不再持有原始键串副本）；
+//!   仅在精确查找未命中时才构建）
+//! - 字节缓存（256MB 上限，按字节计重 + 同样空闲回收；词条整页图片这类热资源命中后零解压）
 //!
 //! 查找顺序与 /dict-res 路由一致：先精确（正/反斜杠、带/不带前导斜杠），
 //! 再走归一化映射兜底（词典多在 Windows 打包，引用与键的大小写常不一致）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use mdictlib::MddFile;
+use mdictlib::{KeyOrdinal, MddFile};
 use moka::sync::Cache as MokaCache;
 use sea_orm::{ConnectionTrait, Statement};
 
 use crate::AppState;
 
-/// 句柄缓存容量（同时服务的 .mdd 个数上限；打开 = 解析 key 索引，毫秒级但没必要重复）
-const MDD_HANDLE_CACHE: usize = 8;
 /// 资源字节缓存上限（按字节数计重）
 const RESOURCE_BYTES_CACHE: usize = 256 * 1024 * 1024;
+/// 单个句柄计重下限（打开本身有文件描述符/头信息等常驻）
+const HANDLE_WEIGHT_FLOOR: u32 = 64 * 1024;
 
 pub struct MddResources {
     handles: MokaCache<PathBuf, Arc<MddHandle>>,
@@ -31,25 +37,35 @@ pub struct MddResources {
 
 struct MddHandle {
     file: MddFile,
-    /// 归一化键索引（小写正斜杠 → 原始键）与 basename 索引（小写文件名 → 原始键），
+    /// 归一化键索引（小写正斜杠 → 物理序号）与 basename 索引（小写文件名 → 物理序号），
     /// 首次大小写/basename 兜底时一并构建
     key_maps: OnceLock<KeyMaps>,
+    /// 常驻内存估算（打开时 = mdictlib memory_usage 实测；KeyMaps 构建后追加），
+    /// 供句柄缓存按字节预算淘汰
+    weight: AtomicU32,
 }
 
 struct KeyMaps {
-    lower: HashMap<String, String>,
-    basename: HashMap<String, String>,
+    lower: HashMap<String, KeyOrdinal>,
+    basename: HashMap<String, KeyOrdinal>,
 }
 
+/// KeyMaps 两张 HashMap 的每条目粗估（键 String + 哈希桶 + KeyOrdinal）
+const KEYMAP_BYTES_PER_ENTRY: u32 = 96;
+
 impl MddResources {
-    pub fn new() -> Self {
+    /// `handle_budget`：句柄缓存字节预算；`idle`：空闲回收时长（句柄与字节缓存同参）
+    pub fn new(handle_budget: usize, idle: Duration) -> Self {
         Self {
             handles: MokaCache::builder()
-                .max_capacity(MDD_HANDLE_CACHE as u64)
+                .max_capacity(handle_budget as u64)
+                .weigher(|_k, v: &Arc<MddHandle>| v.weight.load(Ordering::Relaxed))
+                .time_to_idle(idle)
                 .build(),
             bytes: MokaCache::builder()
                 .max_capacity(RESOURCE_BYTES_CACHE as u64)
                 .weigher(|_k, v: &Arc<Vec<u8>>| v.len() as u32)
+                .time_to_idle(idle)
                 .build(),
         }
     }
@@ -60,6 +76,29 @@ impl MddResources {
         self.handles.invalidate_all();
         self.bytes.invalidate_all();
     }
+
+    /// 触发 moka 维护任务：真正释放空闲过期条目占的内存（空闲期没有读写，
+    /// 维护不会自动跑；由调度器周期调用）
+    pub fn run_maintenance(&self) {
+        self.handles.run_pending_tasks();
+        self.bytes.run_pending_tasks();
+    }
+
+    /// 常驻内存估算合计（诊断/日志用，粗略：条目权重之和）。
+    /// 先跑一次维护：insert 后未处理的条目对 iter() 不可见，直接读会少计
+    pub fn resident_bytes(&self) -> u64 {
+        self.handles.run_pending_tasks();
+        self.bytes.run_pending_tasks();
+        self.handles
+            .iter()
+            .map(|(_, v)| v.weight.load(Ordering::Relaxed) as u64)
+            .sum::<u64>()
+            + self
+                .bytes
+                .iter()
+                .map(|(_, v)| v.len() as u64)
+                .sum::<u64>()
+    }
 }
 
 fn normalize_key(key: &str) -> String {
@@ -68,15 +107,31 @@ fn normalize_key(key: &str) -> String {
         .to_lowercase()
 }
 
+/// 把 usize 权重压进 u32（超过 u32::MAX 按 u32::MAX 计——预算语义下已足够）
+fn clamp_weight(bytes: usize) -> u32 {
+    bytes.min(u32::MAX as usize) as u32
+}
+
 impl MddHandle {
     fn open(path: &PathBuf) -> Result<Self, mdictlib::Error> {
         let options = mdictlib::OpenOptions::default()
             .with_limits(mdictlib::Limits::large_dictionary());
         let file = MddFile::open_with_options(path, &options)?;
-        Ok(Self {
+        let handle = Self {
             file,
             key_maps: OnceLock::new(),
-        })
+            weight: AtomicU32::new(HANDLE_WEIGHT_FLOOR),
+        };
+        // 词头索引（locator）是惰性构建的——主动触发一次（必然 miss 的探测键），
+        // 让 memory_usage() 从一开始就反映真实常驻量，句柄缓存计重才准确。
+        // 这次构建本来也会发生在首个真实查找上，这里只是提前到打开时（都在阻塞线程）。
+        let _ = handle.file.locate("\u{0}mydict-probe");
+        if let Ok(usage) = handle.file.memory_usage() {
+            handle
+                .weight
+                .store(HANDLE_WEIGHT_FLOOR.max(clamp_weight(usage.current_bytes())), Ordering::Relaxed);
+        }
+        Ok(handle)
     }
 
     fn lookup(&self, rel_path: &str) -> Option<Vec<u8>> {
@@ -95,49 +150,53 @@ impl MddHandle {
         // 大小写兜底（归一化映射）
         let maps = self.maps();
         let normalized = normalize_key(rel_path);
-        if let Some(exact) = maps.lower.get(&normalized) {
-            if let Some(resource) = self.file.lookup(exact).ok().flatten() {
+        if let Some(ordinal) = maps.lower.get(&normalized) {
+            if let Ok(Some(resource)) = self.file.resource_at(*ordinal) {
                 return Some(resource.bytes().to_vec());
             }
         }
         // basename 兜底：词典内引用常带与 mdd 不同的目录前缀，只要文件名能对上
         let basename = normalized.rsplit('/').next().unwrap_or(&normalized).to_string();
-        if let Some(key) = maps.basename.get(&basename) {
-            if let Some(resource) = self.file.lookup(key).ok().flatten() {
+        if let Some(ordinal) = maps.basename.get(&basename) {
+            if let Ok(Some(resource)) = self.file.resource_at(*ordinal) {
                 return Some(resource.bytes().to_vec());
             }
         }
         // 后缀包含兜底：引用路径是 mdd 键的后缀（键多出数字 ID 前缀目录等）
         let suffix = format!("/{normalized}");
-        if let Some(key) = maps
-            .lower
-            .values()
-            .find(|k| normalize_key(k).ends_with(&suffix))
-        {
-            if let Some(resource) = self.file.lookup(key).ok().flatten() {
+        if let Some((_, ordinal)) = maps.lower.iter().find(|(k, _)| k.ends_with(&suffix)) {
+            if let Ok(Some(resource)) = self.file.resource_at(*ordinal) {
                 return Some(resource.bytes().to_vec());
             }
         }
         None
     }
 
-    /// 大小写归一化与 basename 双索引（一次遍历建好，OnceLock 保证只建一次）
+    /// 大小写归一化与 basename 双索引（一次遍历建好，OnceLock 保证只建一次）。
+    /// 存物理序号而非原始键串：兜底读取走 resource_at(ordinal)，不重复持有键内存
     fn maps(&self) -> &KeyMaps {
         self.key_maps.get_or_init(|| {
             let mut lower = HashMap::new();
-            let mut basename: HashMap<String, String> = HashMap::new();
-            for key in self.file.keys().flatten() {
-                let owned = key.key().to_string();
-                let norm = normalize_key(&owned);
+            let mut basename: HashMap<String, KeyOrdinal> = HashMap::new();
+            for (index, key) in self.file.keys().enumerate() {
+                let Ok(key) = key else { continue };
+                let ordinal = KeyOrdinal::new(index as u64);
+                let norm = normalize_key(key.key());
                 if let Some(name) = norm.rsplit('/').next() {
-                    basename.entry(name.to_string()).or_insert_with(|| owned.clone());
+                    basename
+                        .entry(name.to_string())
+                        .or_insert(ordinal);
                 }
-                lower.entry(norm).or_insert(owned);
+                lower.entry(norm).or_insert(ordinal);
             }
-            KeyMaps { lower, basename }
+            let built = KeyMaps { lower, basename };
+            // 追加两张索引的估算重量，让缓存预算把这块也算上
+            let entries = (built.lower.len() + built.basename.len()) as u32;
+            let extra = KEYMAP_BYTES_PER_ENTRY.saturating_mul(entries);
+            self.weight.fetch_add(extra, Ordering::Relaxed);
+            built
         })
     }
-
 }
 
 /// 某词典的全部 .mdd 源文件（按导入时的 position 保序；含分卷 .1.mdd 等）
@@ -268,4 +327,60 @@ pub async fn same_name_assets_with_mdd(
         }
     }
     assets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn corpus_mdd() -> Option<PathBuf> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/mdx_v2_basic/basic.mdd");
+        path.is_file().then_some(path)
+    }
+
+    /// 真实 .mdd 上的句柄行为：精确命中、大小写/分隔符兜底、basename 兜底、计重 > 0
+    #[test]
+    fn mdd_handle_lookup_and_weight() {
+        let Some(path) = corpus_mdd() else {
+            eprintln!("skipping: testdata/mdx_v2_basic/basic.mdd 不存在（先跑 scripts/gen_corpus.py）");
+            return;
+        };
+        let handle = MddHandle::open(&path).expect("打开 basic.mdd");
+        // 精确命中（正斜杠请求路径）
+        assert!(handle.lookup("style.css").unwrap().starts_with(b"body {"));
+        // 分隔符 + 大小写兜底（mdd 键是 \img\logo.png）
+        assert!(handle.lookup("IMG/LOGO.PNG").unwrap().starts_with(b"\x89PNG"));
+        // basename 兜底（引用带不同目录前缀）
+        assert!(handle.lookup("whatever/dir/logo.png").unwrap().starts_with(b"\x89PNG"));
+        // 未命中
+        assert!(handle.lookup("nope.bin").is_none());
+        // 打开即计重（locator 已在 open 里构建）
+        assert!(
+            handle.weight.load(Ordering::Relaxed) > 0,
+            "weight 应反映 memory_usage"
+        );
+    }
+
+    /// KeyMaps 构建后权重追加、且二次 maps() 不再重复计重
+    #[test]
+    fn mdd_handle_keymap_weight_accumulates_once() {
+        let Some(path) = corpus_mdd() else {
+            eprintln!("skipping: testdata 缺失");
+            return;
+        };
+        let handle = MddHandle::open(&path).expect("打开 basic.mdd");
+        let before = handle.weight.load(Ordering::Relaxed);
+        let maps = handle.maps();
+        let entries = (maps.lower.len() + maps.basename.len()) as u32;
+        let after = handle.weight.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            KEYMAP_BYTES_PER_ENTRY * entries,
+            "KeyMaps 计重应恰好追加一次"
+        );
+        let _ = handle.maps();
+        assert_eq!(handle.weight.load(Ordering::Relaxed), after, "不重复计重");
+    }
 }

@@ -11,6 +11,14 @@ use server::{configure_app, AppState};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // glibc 默认每线程一个 malloc arena（上限 8×核）：OpenCC 的 C++ 字典与各请求
+    // 线程的临时分配会散落十几个 arena，空闲块互不共享、RSS 虚高且很难归还内核。
+    // 服务实际并发低（单 worker + 少量 blocking 线程），2 个 arena 足够。
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
     let settings = Settings::from_env();
     settings.ensure_data_dirs()?;
     logging::configure_logging(&settings.log_dir);

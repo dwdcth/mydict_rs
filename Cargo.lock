@@ -5227,6 +5227,7 @@ dependencies = [
  "html-escape",
  "jsonwebtoken",
  "kokoro-micro",
+ "libc",
  "lol_html",
  "mdictlib",
  "migration",

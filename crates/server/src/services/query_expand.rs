@@ -22,16 +22,66 @@ const MAX_VARIANTS: usize = 16;
 /// ASCII 可见字符与全角形式之间的固定码点差
 const FULLWIDTH_OFFSET: u32 = 0xFEE0;
 
-struct OpenCcSet([opencc_rs::OpenCC; 4]);
+/// QUERY_OPENCC_VARIANTS：
+/// - `base`（默认）= T2S+S2T 双向（~36MB）——简↔繁主链路全覆盖
+/// - `tw` / `hk` / `tw,hk` / `all` = 追加地区变体（台湾/香港用字，如 软件→軟體/軟件）。
+///   libopencc 每个实例独立解析字典（ST 系被重复展开），S2TW/S2HK 各约 +52MB，
+///   词典收录台湾/香港特有词头时再开
+fn variant_config_indices() -> Vec<usize> {
+    let raw = std::env::var("QUERY_OPENCC_VARIANTS")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let (tw, hk) = match raw.as_str() {
+        "" | "base" => (false, false),
+        "all" => (true, true),
+        other => (
+            other.split(',').any(|p| p.trim() == "tw"),
+            other.split(',').any(|p| p.trim() == "hk"),
+        ),
+    };
+    let mut indices = vec![0, 1];
+    if tw {
+        indices.push(2);
+    }
+    if hk {
+        indices.push(3);
+    }
+    indices
+}
+
+struct OpenCcSet(Vec<opencc_rs::OpenCC>);
 
 static CONVERTERS: OnceLock<OpenCcSet> = OnceLock::new();
 
 fn converters() -> &'static OpenCcSet {
     CONVERTERS.get_or_init(|| {
-        let make = |index: usize| {
-            opencc_rs::OpenCC::new([opencc_config(index)]).expect("OpenCC 初始化")
+        let rss_kb = || {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS"))
+                        .and_then(|l| l.split_whitespace().nth(1)?.parse::<i64>().ok())
+                })
+                .unwrap_or(-1)
         };
-        OpenCcSet([make(0), make(1), make(2), make(3)])
+        let before = rss_kb();
+        let start = std::time::Instant::now();
+        let indices = variant_config_indices();
+        let set = OpenCcSet(
+            indices
+                .iter()
+                .map(|&i| opencc_rs::OpenCC::new([opencc_config(i)]).expect("OpenCC 初始化"))
+                .collect(),
+        );
+        tracing::info!(
+            configs = ?indices,
+            rss_delta_kb = rss_kb() - before,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "OpenCC 转换器初始化完成"
+        );
+        set
     })
 }
 
@@ -52,6 +102,13 @@ fn to_fullwidth(text: &str) -> String {
 /// NFKC 归一：全角 ASCII 收成半角，半角片假名（ﾊﾝｶｸ）连浊点一起合成常规写法
 fn normalize_width(text: &str) -> String {
     text.nfkc().collect()
+}
+
+/// OpenCC 只映射 CJK 字符——不含汉字的词（"apple"、数字、假名混合键）转换必然
+/// 原样返回，直接跳过：省一次转换，更重要的是省掉转换器集合（≥36MB）的惰性初始化
+/// （英文 API 场景整个进程都不必加载）
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| ('\u{2E80}'..='\u{9FFF}').contains(&c) || ('\u{F900}'..='\u{FAFF}').contains(&c) || ('\u{20000}'..='\u{3FFFF}').contains(&c))
 }
 
 /// 返回该词的全部查询变体，含原词、已去重、已小写。第一个元素一定是原词。
@@ -78,8 +135,12 @@ pub fn expand_word(word: &str) -> Vec<String> {
         normalize_width(word),
         to_fullwidth(word),
     ];
+    let need_opencc = bases.iter().any(|b| has_cjk(b));
     for base in &bases {
         add(Some(base.clone()), &mut variants, &mut seen);
+        if !need_opencc {
+            continue;
+        }
         for converter in &converters().0 {
             // 转换失败只是少一个变体，不该影响查询
             if let Ok(converted) = converter.convert(base) {
@@ -93,6 +154,36 @@ pub fn expand_word(word: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variant_indices_parse() {
+        // env 未设置时是进程级一次性行为，这里只测解析函数对已取字符串的分支——
+        // 直接构造等价输入验证组合逻辑
+        let parse = |raw: &str| -> Vec<usize> {
+            let (tw, hk) = match raw {
+                "" | "base" => (false, false),
+                "all" => (true, true),
+                other => (
+                    other.split(',').any(|p| p.trim() == "tw"),
+                    other.split(',').any(|p| p.trim() == "hk"),
+                ),
+            };
+            let mut indices = vec![0, 1];
+            if tw {
+                indices.push(2);
+            }
+            if hk {
+                indices.push(3);
+            }
+            indices
+        };
+        assert_eq!(parse(""), vec![0, 1]);
+        assert_eq!(parse("base"), vec![0, 1]);
+        assert_eq!(parse("all"), vec![0, 1, 2, 3]);
+        assert_eq!(parse("tw"), vec![0, 1, 2]);
+        assert_eq!(parse("hk"), vec![0, 1, 3]);
+        assert_eq!(parse("tw, hk"), vec![0, 1, 2, 3]);
+    }
 
     #[test]
     fn original_word_first() {

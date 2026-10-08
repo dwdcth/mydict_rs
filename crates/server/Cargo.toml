@@ -68,6 +68,10 @@ clap.workspace = true
 fsrs = "6.6.2"
 kokoro-micro = "1.3.0"
 
+# release_idle_memory 里 malloc_trim 归还 arena 空页给内核（仅 Linux）
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 actix-http = "3"
