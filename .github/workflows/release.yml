@@ -55,9 +55,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: mydict-x86_64-linux.tar.gz
             run_tests: true
+            ort_shim: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: mydict-aarch64-linux.tar.gz
+            ort_shim: true
           # 不出 macOS x86_64：ort 的预编译 onnxruntime 只发 arm64 mac，
           # Intel 需自编译 ORT（不值；Intel Mac 用户可用 Docker/Linux 版）
           - os: macos-latest
@@ -99,8 +101,17 @@ jobs:
         if: matrix.run_tests
         run: cargo test --workspace --quiet
 
+      # pyke 预编译 onnxruntime 引用 glibc>=2.38 的 __isoc23_* 符号；垫片
+      # （scripts/isoc23_shim.c）转发到普通 strtol 族后，产物降到 glibc>=2.34，
+      # Debian 12 / Ubuntu 22.04 可直接跑。macOS/Windows 符号没问题，不需要。
+      - name: Fetch ORT static lib + glibc shim
+        if: matrix.ort_shim
+        run: make fetch-ort ORT_TARGET=${{ matrix.target }}
+
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }} -p server
+        env:
+          ORT_LIB_LOCATION: ${{ matrix.ort_shim && format('{0}/.cache/onnxruntime-123', github.workspace) || '' }}
 
       - uses: actions/download-artifact@v4
         with:

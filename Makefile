@@ -23,9 +23,18 @@ test:
 # pyke 预编译 onnxruntime（glibc>=2.38）本机跑不动：手动下载同款 ms@1.23.2
 # 静态库 + isoc23 垫片，ORT_LIB_LOCATION 指过去编译。
 # 运行期首次合成还会自动下载 Kokoro 模型 ~337MB 到 ~/.cache/k/（建议挂卷）。
+# ORT_TARGET 按构建机架构传（linux x86_64 / aarch64）；macOS/Windows 走
+# ort-sys 默认预编译下载（符号没问题），不需要垫片。
+ORT_TARGET ?= x86_64-unknown-linux-gnu
 ORT_DIR := .cache/onnxruntime-123
-ORT_URL := https://cdn.pyke.io/0/pyke:ort-rs/ms@1.23.2/x86_64-unknown-linux-gnu.tar.lzma2
+ORT_URL := https://cdn.pyke.io/0/pyke:ort-rs/ms@1.23.2/$(ORT_TARGET).tar.lzma2
+ifeq ($(ORT_TARGET),x86_64-unknown-linux-gnu)
 ORT_SHA := 8c57d059aaaee407812a5698d6706c79e090ad69e1a14204309e802dcbbaa35f
+else ifeq ($(ORT_TARGET),aarch64-unknown-linux-gnu)
+ORT_SHA := c25248c32d84f228b9d584b84b31e1577e4810d46beb5e304e9fa340c000176c
+else
+$(error 不支持的 ORT_TARGET: $(ORT_TARGET)（垫片方案只准备 了 linux x86_64/aarch64）)
+endif
 
 fetch-ort:
 	@mkdir -p $(ORT_DIR)
