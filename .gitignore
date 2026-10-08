@@ -10,3 +10,4 @@ frontend/dist
 /testdata/
 .cache/
 /tts.wav
+/.claude/
