@@ -322,25 +322,34 @@ pub async fn word_of_the_day(
          WHERE d.status = 'enabled' AND {clean}{where_allowed} AND e.id >= $1 \
          ORDER BY e.id LIMIT 20"
     );
-    let pick_rows = |id: i64| -> Vec<sea_orm::QueryResult> {
+    // 落点向后最多看 20 条，跳过含数字的词头；落点太靠尾（后面全不干净）就环绕回开头再找。
+    // 注意必须 .await：这里曾用 futures::executor::block_on 跑 SQL——连接池需要
+    // 新建连接时，开连接任务排在同一个（单线程测试/工作）runtime 上，而当前线程
+    // 正被 block_on 占着 → 自锁。本地时序总能命中热连接掩盖了问题，CI 冷路径必挂。
+    async fn pick_rows(
+        db: &sea_orm::DatabaseConnection,
+        backend: sea_orm::DbBackend,
+        sql: &str,
+        id: i64,
+        values_allowed: &[sea_orm::Value],
+    ) -> Vec<sea_orm::QueryResult> {
         let mut values = vec![id.into()];
-        values.extend(values_allowed.clone());
-        let stmt = sea_orm::Statement::from_sql_and_values(backend, &sql, values);
-        futures::executor::block_on(app.db.query_all_raw(stmt))
+        values.extend(values_allowed.iter().cloned());
+        db.query_all_raw(sea_orm::Statement::from_sql_and_values(backend, sql, values))
+            .await
             .unwrap_or_default()
-    };
-    // 落点向后最多看 20 条，跳过含数字的词头；落点太靠尾（后面全不干净）就环绕回开头再找
+    }
     fn clean_of(rows: &[sea_orm::QueryResult]) -> Option<&sea_orm::QueryResult> {
         rows.iter().find(|r| {
             let w = r.try_get::<String>("", "word").unwrap_or_default();
             !w.chars().any(|c| c.is_ascii_digit())
         })
     }
-    let mut rows = pick_rows(landing);
+    let mut rows = pick_rows(&app.db, backend, &sql, landing, &values_allowed).await;
     let mut row = clean_of(&rows);
     if row.is_none() {
         // 落点在尾部且后面全不干净 → 环绕回开头
-        rows = pick_rows(lo);
+        rows = pick_rows(&app.db, backend, &sql, lo, &values_allowed).await;
         row = clean_of(&rows);
     }
     let row = row.or_else(|| rows.first());
