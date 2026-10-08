@@ -1760,7 +1760,7 @@ async fn word_audio_probe_and_tts_gate() {
     .await;
     assert_eq!(
         probe["audio_url"].as_str().unwrap(),
-        "/dict-res/{with_audio}/res/us/apple.mp3"
+        format!("/dict-res/{with_audio}/res/us/apple.mp3")
     );
 
     // 无词典语音 → null（前端转 TTS 兜底）

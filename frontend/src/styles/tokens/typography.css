@@ -1,8 +1,19 @@
 :root {
+  /* 生僻字兜底：常见桌面/移动字体之后补 Linux 常见 CJK 字体，
+   * 否则「兓」这类字在未装商业字体的系统上显示为方框。
+   * MydictDictFont = 服务端聚合的词典 @font-face（/api/dict/ui-fonts.css，
+   * 覆盖 PUA 私有区古文字字形），挂在栈末按 unicode-range 逐字回退 */
   --font-family-base:
-    -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+    -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI',
+    'Noto Sans CJK SC', 'Noto Sans SC', 'Source Han Sans SC', 'WenQuanYi Zen Hei',
+    'Droid Sans Fallback', MydictDictFont, sans-serif;
+  /* Element Plus 组件（输入框、按钮等）读 --el-font-family；不重定向的话
+   * 搜索框会被钉在 Arial 上，上面的兜底栈全都进不去 */
+  --el-font-family: var(--font-family-base);
   --font-family-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --font-family-serif: 'Noto Serif SC', Georgia, serif;
+  --font-family-serif:
+    'Noto Serif SC', 'Noto Serif CJK SC', 'Source Han Serif SC', 'WenQuanYi Zen Hei',
+    MydictDictFont, Georgia, serif;
 
   --text-xs: 12px;
   --text-sm: 13px;

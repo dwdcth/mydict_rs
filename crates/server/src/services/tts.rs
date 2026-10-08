@@ -19,6 +19,168 @@ use crate::AppState;
 const SAMPLE_RATE: u32 = 24000;
 /// 合成结果缓存上限（按字节计重）
 const TTS_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// 音频内容版本（缓存键 + 前端 URL 参数）：改合成参数（如语速修正）后递增，
+/// 避免旧缓存继续分发修复前的音频
+const AUDIO_REV: u32 = 9;
+/// kokoro-micro 把「用户语速」乘 `SPEED_SCALE=0.65` 当模型语速。模型语速 0.65
+/// 超出 Kokoro 时长预测器的训练分布：**首音节会被拉成连读两遍**（Whisper 实测
+/// 「你好」→「您-也-好」三个音节、参考实现模型语速 1.0 → 干净两个音节）。
+/// 这里传 1/0.65 把模型语速归一回参考实现的 1.0。
+const SPEED_UNDO: f32 = 1.0 / 0.65;
+/// 孤立单字的额外提速。曾试 1.2：实测会**放大**部分嗓音（晓妮）孤立三声的
+/// 升调尾（「好」→「好嘞」），1.0 干净——提速对单字弊大于利，归一不提。
+const SINGLE_CHAR_SPEEDUP: f32 = 1.0;
+
+/// 词是不是恰好一个汉字（标点/空白不算）
+fn is_single_hanzi(word: &str) -> bool {
+    let mut han = 0;
+    let mut other = 0;
+    for c in word.chars() {
+        if has_cjk(&c.to_string()) {
+            han += 1;
+        } else if !c.is_whitespace() {
+            other += 1;
+        }
+    }
+    han == 1 && other == 0
+}
+
+/// 收紧孤立单字的尾巴：能量降到峰值 65% 以下就收（40ms 淡出 + 20ms 余量）。
+/// 模型对孤立三声的升调余韵会被听成一个「yi」音节（用户与 Whisper 一致报告），
+/// 45% 阈值不够狠——65% 直接切在余韵起来之前，留下的是半三声（只降不升），
+/// 词典报字音场景可接受；干净音节（四声快衰减）只损失自然收尾的一点点。
+fn tighten_tail(samples: &mut [f32]) -> usize {
+    const WIN: usize = 480; // 20ms @24k
+    const TAIL_RATIO: f32 = 0.65;
+    if samples.len() < WIN * 4 {
+        return samples.len();
+    }
+    let n_windows = samples.len() / WIN;
+    let mut peak: f32 = 0.0;
+    let mut rms = vec![0f32; n_windows];
+    for (w, slot) in rms.iter_mut().enumerate() {
+        let mut sum = 0.0;
+        for &v in &samples[w * WIN..(w + 1) * WIN] {
+            sum += v * v;
+        }
+        *slot = (sum / WIN as f32).sqrt();
+        peak = peak.max(*slot);
+    }
+    let threshold = peak * TAIL_RATIO;
+    let Some(last_loud) = rms.iter().rposition(|v| *v > threshold) else {
+        return samples.len();
+    };
+    let cut_end = ((last_loud + 1) * WIN + WIN).min(samples.len());
+    fade_out(samples, cut_end);
+    cut_end
+}
+
+/// 末尾 40ms 线性淡出（在 cut_end 处收笔）
+fn fade_out(samples: &mut [f32], cut_end: usize) {
+    let fade_from = cut_end.saturating_sub(960);
+    for i in fade_from..cut_end {
+        let t = (i - fade_from) as f32 / (cut_end - fade_from).max(1) as f32;
+        samples[i] *= 1.0 - t;
+    }
+}
+
+/// 在**基频谷底**收笔（孤立单字专用）：三声的升调段能量与主体几乎一样高
+/// （实测峰值 75-98%），能量阈值切不掉、却正是被听成「yi」的元凶——
+/// 那段根本不是 /i/ 元音（F2 全程低于 F1×1.5），纯粹是基频上挑的听感。
+/// 谷底后 100ms 内基频回升 ≥ 40Hz 视为「有升段」，在谷底 +20ms 处淡出；
+/// 四声（基频一路降到底）与一声（平）找不到升段 → 原样返回，交给能量兜底。
+fn cut_at_pitch_bottom(samples: &mut [f32]) -> usize {
+    const WIN: usize = 600; // 25ms @24k
+    const HOP: usize = 240; // 10ms
+    const MIN_LAG: usize = 60; // 400Hz
+    const MAX_LAG: usize = 343; // 70Hz
+    let n_frames = samples.len().saturating_sub(WIN) / HOP;
+    if n_frames < 8 {
+        return samples.len();
+    }
+    let mut peak_rms = 0f32;
+    let mut frames: Vec<(f32, f32)> = Vec::with_capacity(n_frames); // (rms, f0)
+    for f in 0..n_frames {
+        let start = f * HOP;
+        let seg = &samples[start..start + WIN];
+        let mean = seg.iter().sum::<f32>() / WIN as f32;
+        let centered: Vec<f32> = seg.iter().map(|v| v - mean).collect();
+        let mut energy = 0.0;
+        for &v in &centered {
+            energy += v * v;
+        }
+        let rms = (energy / WIN as f32).sqrt();
+        peak_rms = peak_rms.max(rms);
+        let mut f0 = 0f32;
+        if rms > 0.05 {
+            let mut best_r = 0f32;
+            let mut best_lag = 0usize;
+            for lag in MIN_LAG..MAX_LAG {
+                let m = WIN - lag;
+                let mut num = 0.0;
+                let mut e1 = 0.0;
+                let mut e2 = 0.0;
+                for j in 0..m {
+                    num += centered[j] * centered[j + lag];
+                    e1 += centered[j] * centered[j];
+                    e2 += centered[j + lag] * centered[j + lag];
+                }
+                let den = (e1 * e2).sqrt();
+                if den > 0.0 {
+                    let r = num / den;
+                    if r > best_r {
+                        best_r = r;
+                        best_lag = lag;
+                    }
+                }
+            }
+            // 归一回 120-350Hz 区间（八度误差修正）
+            if best_r > 0.35 && best_lag > 0 {
+                let mut f = 24000.0 / best_lag as f32;
+                while f > 350.0 {
+                    f /= 2.0;
+                }
+                while f < 120.0 {
+                    f *= 2.0;
+                }
+                f0 = f;
+            }
+        }
+        frames.push((rms, f0));
+    }
+    // 只看后 60% 的有声帧里基频最低的那帧
+    let voiced_threshold = peak_rms * 0.25;
+    let from = n_frames * 2 / 5;
+    let mut bottom: Option<(usize, f32)> = None;
+    for (idx, &(rms, f0)) in frames.iter().enumerate() {
+        if idx < from || rms < voiced_threshold || f0 <= 0.0 {
+            continue;
+        }
+        if bottom.is_none_or(|(_, b)| f0 < b) {
+            bottom = Some((idx, f0));
+        }
+    }
+    let Some((bottom_idx, bottom_f0)) = bottom else {
+        return samples.len();
+    };
+    // 谷底后 100ms（10 帧）内回升 ≥ 40Hz → 确认是三声升段
+    let has_rise = frames[(bottom_idx + 1)..n_frames.min(bottom_idx + 11)]
+        .iter()
+        .any(|&(rms, f0)| rms >= voiced_threshold && f0 >= bottom_f0 + 40.0);
+    if !has_rise {
+        return samples.len();
+    }
+    // 谷底帧就是吱呀+升段的起点，从那里收笔（进入谷底帧 5ms 即淡出），
+    // 保留的是「高降」半三声——词典报字音的紧凑形式。
+    // 保底：吱呀段的 F0 八度误检会把谷底定位得过早、把元音切掉（实测「水」
+    // 被截到 0.17s）——裁剪结果短于 0.22s 或不足原长 55% 时弃用本方法
+    let cut_end = (bottom_idx * HOP + 120).min(samples.len());
+    if cut_end < 24000 * 22 / 100 || (cut_end as f32) < samples.len() as f32 * 0.55 {
+        return samples.len();
+    }
+    fade_out(samples, cut_end);
+    cut_end
+}
 
 pub struct TtsState {
     /// 引擎（含失败闩：Err 为首次初始化的错误信息）。
@@ -46,12 +208,18 @@ impl TtsState {
     }
 }
 
-/// 词里是否含 CJK 字符（选中文嗓音的依据）
+/// 词里是否含 CJK 字符（选中文嗓音的依据）。
+/// 含 PUA 私有区与 CJK 扩展区：说文系字头是 PUA 字形（U+F59A3 等），扩展 B+
+/// 的生僻字同理——它们只可能走「词典注音 → 普通话拼音」兜底，必须选中文嗓音
+/// （英文嗓音读中文音素会把 jin 扭成 jian 一类的怪音）。
 fn has_cjk(text: &str) -> bool {
     text.chars().any(|c| {
         ('\u{4E00}'..='\u{9FFF}').contains(&c)
             || ('\u{3400}'..='\u{4DBF}').contains(&c)
             || ('\u{F900}'..='\u{FAFF}').contains(&c)
+            || ('\u{20000}'..='\u{3FFFF}').contains(&c)
+            || ('\u{E000}'..='\u{F8FF}').contains(&c)
+            || ('\u{F0000}'..='\u{FFFFD}').contains(&c)
     })
 }
 
@@ -89,6 +257,183 @@ async fn tts_settings(db: &DatabaseConnection) -> Result<(bool, String, String),
     Ok((enabled, zh, en))
 }
 
+/// 音素串里有没有「模型会读出声」的东西：IPA 都在 U+E000 以下，而 PUA 私有区
+/// （说文系字头字形）与 astral 扩展区字符会原样混进音素串、到 tokenize 才被丢掉。
+fn has_spoken_phonemes(ps: &str) -> bool {
+    ps.chars().any(|c| {
+        !c.is_whitespace() && !c.is_ascii_punctuation() && (c as u32) < 0xE000
+    })
+}
+
+/// 注音提取规则（管理后台可配，存 system_settings 的 tts_pinyin_rules）。
+/// `pattern` 用 fancy-regex 语法（支持前后看断言）；**第一个捕获组**是拼音，
+/// 没有捕获组时取整体匹配。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PinyinRule {
+    pub name: String,
+    pub pattern: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 解析并校验规则 JSON（数组，或存库的 JSON 字符串）。
+/// 上限与长度约束防滥用；正则逐条编译，坏了一条就整体拒绝并指名道姓。
+pub fn parse_pinyin_rules(value: &serde_json::Value) -> Result<Vec<PinyinRule>, AppError> {
+    let rules: Vec<PinyinRule> = match value {
+        serde_json::Value::String(raw) if raw.trim().is_empty() => return Ok(Vec::new()),
+        serde_json::Value::String(raw) => serde_json::from_str(raw)
+            .map_err(|e| AppError::validation(&format!("tts_pinyin_rules 不是合法 JSON：{e}")))?,
+        serde_json::Value::Array(_) => serde_json::from_value(value.clone())
+            .map_err(|e| AppError::validation(&format!("tts_pinyin_rules 结构不对：{e}")))?,
+        serde_json::Value::Null => return Ok(Vec::new()),
+        other => {
+            return Err(AppError::validation(&format!(
+                "tts_pinyin_rules 应为数组，收到 {other:?}"
+            )))
+        }
+    };
+    if rules.len() > 32 {
+        return Err(AppError::validation("注音提取规则最多 32 条"));
+    }
+    for (idx, rule) in rules.iter().enumerate() {
+        let label = if rule.name.trim().is_empty() {
+            format!("第 {} 条", idx + 1)
+        } else {
+            format!("「{}」", rule.name.trim())
+        };
+        if rule.name.chars().count() > 40 {
+            return Err(AppError::validation(&format!("{label} 名称超过 40 字")));
+        }
+        if rule.pattern.trim().is_empty() {
+            return Err(AppError::validation(&format!("{label} 正则为空")));
+        }
+        if rule.pattern.chars().count() > 500 {
+            return Err(AppError::validation(&format!("{label} 正则超过 500 字")));
+        }
+        if let Err(e) = fancy_regex::Regex::new(&rule.pattern) {
+            return Err(AppError::validation(&format!("{label} 正则编译失败：{e}")));
+        }
+    }
+    Ok(rules)
+}
+
+/// 用一条编译好的规则从文本里提注音：第一个捕获组，无捕获组取整体匹配
+fn extract_rule(rule: &fancy_regex::Regex, text: &str) -> Option<String> {
+    let caps = rule.captures(text).ok().flatten()?;
+    let group = caps
+        .get(1)
+        .or_else(|| caps.get(0))?;
+    let value = group.as_str().trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// 拼音像不像拼音（提取结果的守门员：长度 + 字符白名单）
+fn plausible_pinyin(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 30
+        && t.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || "üvāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜńňǹḿ' -".contains(c)
+        })
+}
+
+/// 读取管理后台配置的规则（坏 JSON 静默降级为空——朗读不能因为配置损坏而 500）
+async fn load_pinyin_rules(db: &DatabaseConnection) -> Vec<PinyinRule> {
+    let raw = crate::services::settings_service::get_setting(db, "tts_pinyin_rules", Some(""))
+        .await
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let value = serde_json::Value::String(raw);
+    parse_pinyin_rules(&value).unwrap_or_default()
+}
+
+/// 从词典里找这个词的注音（PUA 生僻字等无法字面转写时的 TTS 兜底）：
+/// 1) `dict_entries.phonetic` 列（长得像拼音才用）
+/// 2) **管理后台配置的正则规则**（按序，第一个捕获组 = 拼音）
+/// 3) 内置兜底：`<py>jīn</py>`（说文系）/ `class="py">yù<`（古今系）
+/// 词头本身可能是 `@@@LINK=兓兓` 这种链接词条（PUA 字形 → 正字），跟随最多 5 跳。
+async fn find_pronunciation_hint(db: &DatabaseConnection, word: &str) -> Option<String> {
+    let plausible = |s: &str| -> bool { plausible_pinyin(s) };
+
+    let mut current = word.trim().to_string();
+    for _ in 0..5 {
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT phonetic, definition FROM dict_entries WHERE word_lower = $1 LIMIT 8",
+                [current.to_lowercase().into()],
+            ))
+            .await
+            .ok()?;
+
+        for row in &rows {
+            if let Ok(p) = row.try_get::<String>("", "phonetic") {
+                if plausible(&p) {
+                    return Some(p.trim().to_string());
+                }
+            }
+        }
+        let custom_rules = load_pinyin_rules(db).await;
+        for row in &rows {
+            let Ok(def) = row.try_get::<String>("", "definition") else {
+                continue;
+            };
+            for rule in &custom_rules {
+                if !rule.enabled {
+                    continue;
+                }
+                let Ok(compiled) = fancy_regex::Regex::new(&rule.pattern) else {
+                    continue;
+                };
+                if let Some(p) = extract_rule(&compiled, &def) {
+                    if plausible(&p) {
+                        return Some(p);
+                    }
+                }
+            }
+            // <py>…</py>（说文系）
+            if let Some(start) = def.find("<py>") {
+                let rest = &def[start + 4..];
+                if let Some(end) = rest.find("</py>") {
+                    let p = rest[..end].trim();
+                    if plausible(p) {
+                        return Some(p.to_string());
+                    }
+                }
+            }
+            // class="py">…<（古今系）
+            if let Some(start) = def.find("class=\"py\"") {
+                let rest = &def[start..];
+                if let Some(open) = rest.find('>') {
+                    let inner = &rest[open + 1..];
+                    let end = inner.find('<').unwrap_or(inner.len().min(30));
+                    let p = inner[..end].trim();
+                    if plausible(p) {
+                        return Some(p.to_string());
+                    }
+                }
+            }
+        }
+        // 没找到注音：跟随 @@@LINK 换目标再找
+        let next = rows.iter().find_map(|row| {
+            let def = row.try_get::<String>("", "definition").ok()?;
+            let target = def.trim().strip_prefix("@@@LINK=")?.trim();
+            let target = target.split_whitespace().next()?.trim();
+            (!target.is_empty()).then(|| target.to_string())
+        })?;
+        if next == current {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
 /// 合成并返回 WAV 字节（24kHz mono 16-bit）
 pub async fn synthesize_wav(
     state: &AppState,
@@ -121,10 +466,6 @@ pub async fn synthesize_wav_with_voice(
         }
         _ => pick_voice(word, lang_hint, &zh_voice, &en_voice),
     };
-    let cache_key = format!("{voice}|{word}");
-    if let Some(hit) = state.tts.audio.get(&cache_key) {
-        return Ok(hit);
-    }
 
     // 引擎懒加载（首次会下载模型；失败闩住直到重启）
     let engine = match state.tts.engine.get() {
@@ -163,6 +504,46 @@ pub async fn synthesize_wav_with_voice(
         }
     };
 
+    let text = word.to_string();
+
+    // 字面转写不出读音（PUA 生僻字、表意描述符等）→ 用词典注音兜底。
+    // 探测用「自然语言」嗓音（管理员试听指定的嗓音不影响判定）；
+    // 兜底出来的必然是普通话拼音，合成必须用中文嗓音——英文嗓音读中文
+    // 音素会把 jin 扭成 jian 一类的怪音。缓存键用最终嗓音，放在定案之后。
+    // 注意：std Mutex guard 不能跨 await，探测锁在块内放下。
+    let literal_ok = {
+        let probe_voice = pick_voice(word, lang_hint, &zh_voice, &en_voice);
+        let guard = engine
+            .lock()
+            .map_err(|_| AppError::internal_msg("TTS 引擎锁中毒"))?;
+        guard
+            .phonemize(&text, Some(&probe_voice))
+            .map(|ps| has_spoken_phonemes(&ps))
+            .unwrap_or(false)
+    };
+    let pinyin_fallback = if literal_ok {
+        None
+    } else {
+        match find_pronunciation_hint(&state.db, word).await {
+            Some(p) => Some(p),
+            None => {
+                return Err(AppError::validation(
+                    "这个词读不出来：字库里没有它的读音，词典里也没找到注音",
+                ))
+            }
+        }
+    };
+    let voice = if pinyin_fallback.is_some() {
+        zh_voice
+    } else {
+        voice
+    };
+
+    let cache_key = format!("{AUDIO_REV}|{voice}|{word}");
+    if let Some(hit) = state.tts.audio.get(&cache_key) {
+        return Ok(hit);
+    }
+
     // CPU 密集：单并发信号量 + 阻塞线程
     let _permit = state
         .tts
@@ -170,13 +551,22 @@ pub async fn synthesize_wav_with_voice(
         .acquire()
         .await
         .map_err(|e| AppError::internal("tts-semaphore", e))?;
-    let text = word.to_string();
+
     let engine_for_task = engine.clone();
+    let single_char = is_single_hanzi(word);
     let samples = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, String> {
         let engine_guard = engine_for_task
             .lock()
             .map_err(|_| "TTS 引擎锁中毒".to_string())?;
-        engine_guard.synthesize_with_options(&text, Some(&voice), 1.0, 1.0, None)
+        let speed = if single_char {
+            SPEED_UNDO * SINGLE_CHAR_SPEEDUP
+        } else {
+            SPEED_UNDO
+        };
+        match pinyin_fallback {
+            Some(pinyin) => engine_guard.synthesize_pinyin(&pinyin, Some(&voice), speed, 1.0),
+            None => engine_guard.synthesize_with_options(&text, Some(&voice), speed, 1.0, None),
+        }
     })
     .await
     .map_err(|e| AppError::internal("tts-join", e))?
@@ -184,8 +574,25 @@ pub async fn synthesize_wav_with_voice(
 
     // 裁掉首尾静音：kokoro 输出常带 0.4s 头部 + 1s+ 尾部死寂，整句朗读时
     // 「说完隔一秒又来一段」的听感就是它造成的
-    let trimmed = trim_silence(&samples);
-    let wav = Arc::new(f32_to_wav(&trimmed));
+    let mut trimmed = trim_silence(&samples);
+    let final_len = if single_char {
+        // 基频谷底法（三声升段 = 「yi」听感的元凶，能量切不掉）与能量法
+        // 各算各的，取更严的那个——谷底检测偏晚时能量法兜住，反之亦然
+        let mut by_pitch = trimmed.clone();
+        let pitch_cut = cut_at_pitch_bottom(&mut by_pitch);
+        let mut by_energy = trimmed.clone();
+        let energy_cut = tighten_tail(&mut by_energy);
+        if pitch_cut <= energy_cut {
+            trimmed = by_pitch;
+            pitch_cut
+        } else {
+            trimmed = by_energy;
+            energy_cut
+        }
+    } else {
+        trimmed.len()
+    };
+    let wav = Arc::new(f32_to_wav(&trimmed[..final_len]));
     state.tts.audio.insert(cache_key, wav.clone());
     Ok(wav)
 }
@@ -312,6 +719,9 @@ mod tests {
         assert_eq!(pick_voice("apple", Some("zh-Hans"), "zf_a", "af_b"), "zf_a");
         // 中文词 + en 提示 → 词形优先（中文词用英文嗓音会嘟囔）
         assert_eq!(pick_voice("苹果", Some("en"), "zf_a", "af_b"), "zf_a");
+        // PUA 私有区字头（说文系）与扩展 B 生僻字 → 中文嗓音（走注音兜底）
+        assert_eq!(pick_voice("\u{F59A3}\u{F59A3}", None, "zf_a", "af_b"), "zf_a");
+        assert_eq!(pick_voice("\u{204C3}", None, "zf_a", "af_b"), "zf_a");
     }
 
     #[test]
@@ -339,6 +749,86 @@ mod tests {
         assert_eq!(first_audio_url("<p>n. 苹果</p>", 7), None);
         // 图片不算
         assert_eq!(first_audio_url(r#"<img src="a.png">"#, 7), None);
+    }
+
+    #[test]
+    fn pinyin_rules_parse_and_validate() {
+        // 数组与 JSON 字符串两种形态都能解析
+        let rules = parse_pinyin_rules(&serde_json::json!([
+            {"name": "说文 py", "pattern": "<py>([^<]+)</py>"},
+            {"name": "停用示例", "pattern": "x", "enabled": false},
+        ]))
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].enabled);
+        assert!(!rules[1].enabled);
+        let as_str = parse_pinyin_rules(&serde_json::Value::String(
+            r#"[{"name":"a","pattern":"b"}]"#.to_string(),
+        ))
+        .unwrap();
+        assert_eq!(as_str.len(), 1);
+        // 空串 / null = 无规则
+        assert!(parse_pinyin_rules(&serde_json::Value::String(String::new())).unwrap().is_empty());
+        assert!(parse_pinyin_rules(&serde_json::Value::Null).unwrap().is_empty());
+        // 坏正则指名道姓
+        let err = parse_pinyin_rules(&serde_json::json!([
+            {"name": "坏的", "pattern": "(unclosed"},
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("坏的"), "{err}");
+        // 条数上限
+        let many: Vec<_> = (0..33)
+            .map(|i| serde_json::json!({"name": format!("r{i}"), "pattern": "x"}))
+            .collect();
+        assert!(parse_pinyin_rules(&serde_json::Value::Array(many)).is_err());
+    }
+
+    #[test]
+    fn rule_extraction_uses_first_capture_group() {
+        let re = fancy_regex::Regex::new(r"<音>([a-züāáǎàēéěèīíǐìōóǒòūúǔù]+)</音>").unwrap();
+        let html = "<span>字</span><音>jīn</音>";
+        assert_eq!(extract_rule(&re, html).as_deref(), Some("jīn"));
+        // 无捕获组 → 整体匹配
+        let re2 = fancy_regex::Regex::new(r"[a-z]+īn").unwrap();
+        assert_eq!(extract_rule(&re2, html).as_deref(), Some("jīn"));
+        // 不命中
+        let re3 = fancy_regex::Regex::new(r"<x>(.+)</x>").unwrap();
+        assert_eq!(extract_rule(&re3, html), None);
+    }
+
+    #[test]
+    fn single_hanzi_detection() {
+        assert!(is_single_hanzi("好"));
+        assert!(is_single_hanzi("兓"));
+        assert!(is_single_hanzi("  豫 "));
+        assert!(!is_single_hanzi("好奇"));
+        assert!(!is_single_hanzi("好。"));
+        assert!(!is_single_hanzi("apple"));
+        assert!(!is_single_hanzi(""));
+    }
+
+    #[test]
+    fn tighten_tail_cuts_weak_creak() {
+        // 主体 0.3s 全幅 + 尾巴 0.3s 半幅吱呀：尾巴应被收紧到 ~45% 阈值处
+        let mut samples = Vec::new();
+        for i in 0..7200 {
+            let t = i as f32 / 24000.0;
+            let amp = if i < 7200 / 2 { 0.8 } else { 0.5 };
+            samples.push(amp * (2.0 * std::f32::consts::PI * 220.0 * t).sin());
+        }
+        let cut = tighten_tail(&mut samples);
+        // 主体（0.3s=7200 样本一半=3600）必须完整保留，尾巴（0.5 幅度 > 45%*0.8=0.36
+        // 仍在）说明半幅尾巴高于阈值不会被砍——构造再低一点的尾巴验证会砍：
+        assert!(cut >= 3600, "主体不能被裁：{cut}");
+        let mut s2 = Vec::new();
+        for i in 0..7200 {
+            let t = i as f32 / 24000.0;
+            let amp = if i < 3600 { 0.8 } else { 0.2 }; // 尾巴 20% < 45%
+            s2.push(amp * (2.0 * std::f32::consts::PI * 220.0 * t).sin());
+        }
+        let cut2 = tighten_tail(&mut s2);
+        assert!(cut2 < 4800, "低幅尾巴应被裁：{cut2}");
+        assert!(cut2 >= 3600, "主体不能被裁：{cut2}");
     }
 }
 
@@ -402,6 +892,119 @@ mod preview_gen {
                 .unwrap();
             tts.save_wav(&format!("/tmp/tts-previews/{voice}.wav"), &audio).unwrap();
             println!("{voice} ok");
+        }
+    }
+}
+
+#[cfg(test)]
+mod dup_probe {
+    #[test]
+    #[ignore = "需要本地模型"]
+    fn probe_dup() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        for w in ["豫", "章", "豫章", "豫章故郡", "好奇", "apple"] {
+            let p = tts.phonemize(w, Some("zf_xiaobei")).unwrap();
+            println!("{w}  →  {p}");
+        }
+        // 用户报「两个豫」的完整试听句 + 分句对照
+        let sentence = "豫章故郡，洪都新府。星分翼轸，地接衡庐。";
+        println!("试听句 →  {}", tts.phonemize(sentence, Some("zf_xiaobei")).unwrap());
+        for clause in ["豫章故郡", "洪都新府", "星分翼轸", "地接衡庐"] {
+            println!("分句[{clause}] →  {}", tts.phonemize(clause, Some("zf_xiaobei")).unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod path_equiv_probe {
+    /// 两条链路同音素是否同音频：cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要本地模型"]
+    fn probe_path_equivalence() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        let a = tts.synthesize_with_options("金", Some("zf_xiaobei"), 1.0 / 0.65, 1.0, None).unwrap();
+        let b = tts.synthesize_pinyin("jīn", Some("zf_xiaobei"), 1.0 / 0.65, 1.0).unwrap();
+        println!("字面路径: {} 样本, {:?}…", a.len(), &a[..4]);
+        println!("拼音路径: {} 样本, {:?}…", b.len(), &b[..4]);
+        println!("相同: {}", a == b);
+        if a != b && a.len() == b.len() {
+            let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+            println!("差异样本数: {}/{}", diff, a.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod single_char_speed_probe {
+    /// 单字不同模型语速的时长/听感：cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要本地模型"]
+    fn probe_speeds() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        for model_speed in [1.0f32, 1.1, 1.2, 1.3] {
+            let user_speed = model_speed / 0.65; // 引擎内部再乘 0.65
+            let a = tts.synthesize_with_options("好", Some("zf_xiaobei"), user_speed, 1.0, None).unwrap();
+            println!("模型语速 {model_speed}: 好 = {:.2}s", a.len() as f32 / 24000.0);
+            let _ = tts.save_wav(&format!("/tmp/hao_sp{model_speed}.wav"), &a);
+        }
+    }
+}
+
+#[cfg(test)]
+mod single_char_tail_probe {
+    /// 单字加标点对尾巴的影响：cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要本地模型"]
+    fn probe_punct_tail() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        let mut idx = 0usize;
+        for text in ["好", "好。", "好，", "好！", "五", "五。"] {
+            idx += 1;
+            let a = tts.synthesize_with_options(text, Some("zf_xiaobei"), 1.0 / 0.65 * 1.2, 1.0, None).unwrap();
+            // 模拟服务端：trim_silence + 65% 收尾后的时长
+            let trimmed = super::trim_silence(&a);
+            let mut t = trimmed.clone();
+            let cut = super::tighten_tail(&mut t);
+            println!(
+                "{text:>4}: 原始 {:.2}s / 裁静音 {:.2}s / 收尾后 {:.2}s",
+                a.len() as f32 / 24000.0,
+                trimmed.len() as f32 / 24000.0,
+                cut as f32 / 24000.0
+            );
+            let _ = tts.save_wav(&format!("/tmp/tail_{idx}.wav"), &t[..cut]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod speed_voice_matrix_probe {
+    use super::trim_silence;
+
+    /// 速度×嗓音矩阵（临时）：cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要本地模型"]
+    fn matrix() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let tts = rt.block_on(kokoro_micro::TtsEngine::new()).unwrap();
+        for voice in ["zf_xiaobei", "zf_xiaoni", "zm_yunjian"] {
+            for model_speed in [1.0f32, 1.2] {
+                let tag = format!("{voice}_{model_speed}");
+                let a = tts
+                    .synthesize_with_options("好", Some(voice), model_speed / 0.65, 1.0, None)
+                    .unwrap();
+                let trimmed = trim_silence(&a);
+                let _ = tts.save_wav(&format!("/tmp/mx_{tag}_raw.wav"), &a);
+                let _ = tts.save_wav(&format!("/tmp/mx_{tag}_trim.wav"), &trimmed);
+                println!(
+                    "{tag}: raw {:.2}s trim {:.2}s",
+                    a.len() as f32 / 24000.0,
+                    trimmed.len() as f32 / 24000.0
+                );
+            }
         }
     }
 }

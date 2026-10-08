@@ -206,7 +206,12 @@ pub fn render_entries_document(
 
     let body = if single {
         let definition = entries[0].definition;
-        if DOCTYPE_OR_HTML_RE.is_match(definition) {
+        if is_dead_link(definition) {
+            return format!(
+                "<!DOCTYPE html><html lang=\"zh\"><head>{head}</head><body>{}</body></html>",
+                dead_link_notice(definition)
+            );
+        } else if DOCTYPE_OR_HTML_RE.is_match(definition) {
             let m = HEAD_OPEN_RE
                 .find(definition)
                 .or_else(|| HTML_OPEN_RE.find(definition));
@@ -235,9 +240,14 @@ pub fn render_entries_document(
                     html_escape(phonetic)
                 ));
             }
+            let definition = if is_dead_link(entry.definition) {
+                dead_link_notice(entry.definition)
+            } else {
+                entry.definition.to_string()
+            };
             blocks.push_str(&format!(
                 r#"<section class="mydict-entry"><div class="mydict-entry-head">{label}</div>{}</section>"#,
-                entry.definition
+                definition
             ));
         }
         blocks
@@ -245,6 +255,28 @@ pub fn render_entries_document(
 
     format!(
         "<!DOCTYPE html><html lang=\"zh\"><head>{head}</head><body>{body}</body></html>"
+    )
+}
+
+/// 释义是不是一条解引用失败的 @@@LINK 行（目标不存在时查询服务会把链接词条
+/// 本身返回来渲染——裸文本对用户不友好）
+fn is_dead_link(definition: &str) -> bool {
+    definition.trim_start().to_lowercase().starts_with("@@@link=")
+}
+
+/// 死链词条的提示卡片（内联样式：词条文档的 CSS 来自词典，类名靠不住）
+fn dead_link_notice(definition: &str) -> String {
+    let target = definition
+        .trim()
+        .split_once('=')
+        .map(|(_, t)| t.trim())
+        .filter(|t| !t.is_empty())
+        .unwrap_or("（空目标）");
+    format!(
+        "<div style=\"margin:12px 0;padding:10px 14px;border:1px solid #d8e2de;\
+border-radius:8px;color:#5b6b66;font-size:14px;line-height:1.7;background:#f6f8f7\">\
+🔗 本词条是指向「{}」的跳转链接，但目标词条在这部词典里不存在（词典数据缺失）。</div>",
+        html_escape(target)
     )
 }
 
@@ -290,6 +322,40 @@ mod tests {
         // 引导脚本已替换占位符
         assert!(doc.contains("__MYDICT_DICT_ID__") == false);
         assert!(doc.contains("document.documentElement"));
+    }
+
+    #[test]
+    fn dead_link_entry_renders_notice_not_raw_text() {
+        // 死链（@@@LINK 目标不存在）：提示卡片替代裸链接文本
+        let doc = render_entries_document(
+            &[RenderEntry {
+                word: "aple",
+                definition: "@@@LINK=nonexistent-entry",
+                phonetic: None,
+            }],
+            1,
+            None,
+            false,
+            &assets(),
+        );
+        assert!(doc.contains("跳转链接"), "应渲染提示卡片");
+        assert!(doc.contains("nonexistent-entry"), "提示里应给出目标词头");
+        assert!(!doc.contains("<body>@@@LINK"), "不能裸奔链接文本");
+
+        // 同名多条里混一条死链也替换
+        let doc = render_entries_document(
+            &[
+                RenderEntry { word: "w", definition: "正常释义", phonetic: None },
+                RenderEntry { word: "w", definition: "@@@link=Missing", phonetic: None },
+            ],
+            1,
+            None,
+            false,
+            &assets(),
+        );
+        assert!(doc.contains("正常释义"));
+        assert!(doc.contains("跳转链接"));
+        assert!(!doc.contains("@@@link=Missing"));
     }
 
     #[test]

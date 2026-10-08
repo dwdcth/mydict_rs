@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as settingsApi from '../../api/admin/settings'
 import { fetchTtsBlob } from '../../api/dict'
+import { useTtsPlayer } from '../../utils/ttsPlayer'
 import RefreshButton from '../../components/admin/RefreshButton.vue'
 
 const loading = ref(true)
@@ -24,6 +25,7 @@ const form = reactive({
   tts_enabled: false,
   tts_voice_zh: 'zf_xiaoni',
   tts_voice_en: 'af_heart',
+  tts_pinyin_rules: [] as Array<{ name: string; pattern: string; enabled: boolean }>,
 })
 
 // 在线词典源开关。后端存 CSV（空 = 全部启用，向后兼容），界面用 checkbox 数组。
@@ -63,9 +65,9 @@ const onlineSourceSelection = ref<string[]>([])
 
 const previewingZh = ref(false)
 const previewingEn = ref(false)
-let previewAudio: HTMLAudioElement | null = null
 
-/** 试听：指定嗓音合成一句固定样本并播放（不落设置） */
+/** 试听：指定嗓音合成一句固定样本并播放（不落设置）。
+ * 走全局 ttsPlayer（解锁过的共享 Audio 实例），合成完成后能直接出声 */
 async function previewVoice(voice: string) {
   if (!voice.trim()) return
   const isZh = voice.startsWith('z')
@@ -79,11 +81,9 @@ async function previewVoice(voice: string) {
       [await fetchTtsBlob(sample, undefined, voice)],
       { type: 'audio/wav' },
     )
-    previewAudio?.pause()
     const url = URL.createObjectURL(blob)
-    previewAudio = new Audio(url)
-    previewAudio.onended = () => URL.revokeObjectURL(url)
-    await previewAudio.play()
+    await useTtsPlayer().playUrl(url, `嗓音试听 ${voice}`)
+    URL.revokeObjectURL(url)
   } catch {
     /* 拦截器已提示 */
   } finally {
@@ -133,11 +133,40 @@ async function save() {
   }
   saving.value = true
   try {
+    // 规则先过一遍本地 trim（空正则交给后端校验会报错，这里提前拦）
+    form.tts_pinyin_rules = form.tts_pinyin_rules.map((r) => ({
+      name: r.name.trim(),
+      pattern: r.pattern,
+      enabled: r.enabled,
+    }))
     const updated = await settingsApi.updateSettings({ ...form })
     Object.assign(form, updated)
     ElMessage.success('设置已保存')
   } finally {
     saving.value = false
+  }
+}
+
+// --- TTS 注音提取规则 -------------------------------------------------------
+
+function addPinyinRule() {
+  form.tts_pinyin_rules.push({ name: '', pattern: '', enabled: true })
+}
+
+const ruleTestText = ref('')
+const ruleTesting = ref(false)
+const ruleTestResults = ref<Array<{ name: string; matched: boolean; value: string | null; note?: string }> | null>(null)
+
+/** 用当前编辑中的规则跑一次提取（后端正则引擎，与朗读路径同口径） */
+async function testPinyinRules() {
+  ruleTesting.value = true
+  try {
+    const res = await settingsApi.testPinyinRules(form.tts_pinyin_rules, ruleTestText.value)
+    ruleTestResults.value = res.results
+  } catch {
+    /* 校验错误由拦截器提示 */
+  } finally {
+    ruleTesting.value = false
   }
 }
 </script>
@@ -330,6 +359,55 @@ async function save() {
           ~/.cache/k/，下载与加载需要一点时间；之后结果按词缓存，重复播放零成本。
           嗓音名决定语言（zf_*/zm_* 中文、af_*/bf_* 英语等九语内建）。
         </p>
+
+        <h3 class="sub-title">注音提取规则（生僻字读音兜底）</h3>
+        <p class="hint">
+          词头是 PUA 私有区字形（说文系古文字）这类读不出音的字时，TTS 会从词条里找拼音：
+          先看 phonetic 列，再按下面的规则（按序、<b>第一个捕获组</b> = 拼音，
+          支持前后看断言），最后是内置兜底 &lt;py&gt;…&lt;/py&gt; 与 class="py"。
+          @@@LINK 链接词条会自动跟随（最多 5 跳）。
+        </p>
+        <div v-for="(rule, idx) in form.tts_pinyin_rules" :key="idx" class="rule-row">
+          <el-switch v-model="rule.enabled" />
+          <el-input v-model="rule.name" placeholder="规则名（如：说文 py）" class="rule-name" />
+          <el-input
+            v-model="rule.pattern"
+            :placeholder="'正则，如 <py>([^<]+)</py>'"
+            class="rule-pattern"
+            spellcheck="false"
+          />
+          <el-button type="danger" text title="删除这条规则" @click="form.tts_pinyin_rules.splice(idx, 1)">
+            删除
+          </el-button>
+        </div>
+        <el-button text type="primary" @click="addPinyinRule">＋ 添加规则</el-button>
+
+        <el-form-item class="rule-test">
+          <template #label>规则测试（贴一段释义 HTML）</template>
+          <el-input
+            v-model="ruleTestText"
+            type="textarea"
+            :rows="3"
+            placeholder='例如：<td py><py>jīn</py></td>'
+            spellcheck="false"
+          />
+          <div class="rule-test-actions">
+            <el-button :loading="ruleTesting" :disabled="!ruleTestText.trim()" @click="testPinyinRules">
+              用当前编辑中的规则测试
+            </el-button>
+          </div>
+          <ul v-if="ruleTestResults" class="rule-test-results">
+            <li v-for="(r, i) in ruleTestResults" :key="i">
+              <el-tag :type="r.matched ? 'success' : 'info'" size="small">
+                {{ r.matched ? '命中' : '未命中' }}
+              </el-tag>
+              {{ r.name }}：
+              <code v-if="r.value">{{ r.value }}</code>
+              <span v-else class="hint">—</span>
+              <span v-if="r.note" class="hint">{{ r.note }}</span>
+            </li>
+          </ul>
+        </el-form-item>
       </section>
 
       <el-button type="primary" :loading="saving" @click="save">保存设置</el-button>
@@ -406,6 +484,48 @@ h1 {
 .source-group {
   display: flex;
   flex-wrap: wrap;
+}
+
+.sub-title {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: var(--text-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+.rule-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.rule-row .rule-name {
+  flex: 0 0 180px;
+}
+
+.rule-row .rule-pattern {
+  flex: 1;
+  font-family: var(--font-family-mono);
+}
+
+.rule-test {
+  margin-top: var(--space-4);
+}
+
+.rule-test-actions {
+  margin-top: var(--space-2);
+}
+
+.rule-test-results {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-5);
+  font-size: var(--text-sm);
+  line-height: 1.9;
+}
+
+.rule-test-results code {
+  font-family: var(--font-family-mono);
+  color: var(--color-brand-600, var(--color-brand-500));
 }
 
 .hint code {

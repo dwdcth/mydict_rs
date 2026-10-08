@@ -446,6 +446,19 @@ pub async fn word_tts(
         .body(wav.to_vec()))
 }
 
+/// GET /api/dict/ui-fonts.css —— 启用词典 @font-face 聚合（前端 UI 的 PUA
+/// 生僻字字形兜底）。匿名可取：内容不含私有信息，服务端再缓存 10 分钟。
+pub async fn ui_fonts(app: web::Data<std::sync::Arc<AppState>>) -> HttpResponse {
+    let css = crate::services::ui_fonts::ui_fonts_css(&app).await;
+    HttpResponse::Ok()
+        .content_type("text/css; charset=utf-8")
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=600",
+        ))
+        .body(css.to_string())
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/dict/dictionaries", web::get().to(dictionaries))
         .route("/dict/search", web::get().to(search))
@@ -453,5 +466,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/dict/history", web::get().to(history))
         .route("/dict/word-of-the-day", web::get().to(word_of_the_day))
         .route("/dict/audio", web::get().to(word_audio))
-        .route("/dict/tts", web::get().to(word_tts));
+        .route("/dict/tts", web::get().to(word_tts))
+        .route("/dict/ui-fonts.css", web::get().to(ui_fonts));
 }

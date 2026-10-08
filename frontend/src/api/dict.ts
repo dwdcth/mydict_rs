@@ -170,10 +170,10 @@ export function fetchWordAudio(word: string, dictionaryId: number) {
   )
 }
 
-/** TTS 词语合成（kokoro-micro，WAV blob；首次合成 1-2 秒） */
+/** TTS 词语合成（kokoro-micro，WAV blob；首次合成 1-2 秒）。v = 音频内容版本，服务端改合成参数后递增以击穿浏览器缓存 */
 export function fetchTtsBlob(text: string, lang?: string, voice?: string) {
   return request.get<BlobPart, BlobPart>('/dict/tts', {
-    params: { text, lang, voice },
+    params: { text, lang, voice, v: 9 },
     responseType: 'blob',
     timeout: 60_000,
   })

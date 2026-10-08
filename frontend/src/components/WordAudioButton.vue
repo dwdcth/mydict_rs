@@ -9,9 +9,9 @@ import { useTtsPlayer } from '../utils/ttsPlayer'
  *   地址）；播放失败（资源缺失等）自动回退 TTS
  * - 没有语音 → 喇叭 + 右上角「T」角标，点击用 kokoro TTS 合成播放
  *
- * 播放统一走全局 ttsPlayer（与选区朗读共用）：串号去重保证任何双击/双触发
- * 只会有一路声音——此前按钮私有 Audio 与全局播放器互不去重，手机快速双击时
- * 会出现两个 Audio 先后起播（听感「豫…豫章」发了两个音）。
+ * 两条路径统一走全局 ttsPlayer：同一时刻只有一个 Audio 实例，且同一段
+ * 加载中/播放中的重复触发会被忽略——此前词典音频走按钮私有 Audio，
+ * 双击会「y- 被截断 + 整段重播」，听感就是首音节发了两个音（豫、豫章）。
  */
 const props = defineProps<{
   word: string
@@ -23,7 +23,6 @@ type Mode = 'loading' | 'dict' | 'tts'
 const mode = ref<Mode>('loading')
 const audioUrl = ref<string | null>(null)
 const player = useTtsPlayer()
-const playingThisWord = ref(false)
 
 /** 播放器状态与本词条对上时显示进行中（避免按钮在别的文本朗读时也转圈） */
 const busy = computed(
@@ -41,16 +40,6 @@ onMounted(async () => {
   }
 })
 
-let dictAudio: HTMLAudioElement | null = null
-
-function stopDictAudio() {
-  if (dictAudio) {
-    dictAudio.pause()
-    dictAudio = null
-  }
-  playingThisWord.value = false
-}
-
 function fallbackToTts() {
   // 词典音频失效 → 本词条后续点击直接走 TTS
   mode.value = 'tts'
@@ -64,18 +53,7 @@ function onClick() {
     return
   }
   if (mode.value === 'dict' && audioUrl.value) {
-    stopDictAudio()
-    playingThisWord.value = true
-    dictAudio = new Audio(audioUrl.value)
-    dictAudio.onended = () => stopDictAudio()
-    dictAudio.onerror = () => {
-      stopDictAudio()
-      fallbackToTts()
-    }
-    dictAudio.play().catch(() => {
-      stopDictAudio()
-      fallbackToTts()
-    })
+    player.playUrl(audioUrl.value, props.word, fallbackToTts)
     return
   }
   player.play(props.word)

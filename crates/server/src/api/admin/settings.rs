@@ -33,7 +33,73 @@ pub async fn update_settings(
     ))
 }
 
+#[derive(serde::Deserialize)]
+pub struct PinyinRuleTestQuery {
+    /// 待测规则（缺省 = 已保存的规则，方便「保存后再验一遍」）
+    #[serde(default)]
+    pub rules: Option<Value>,
+    /// 样本文本（贴一段释义 HTML）
+    pub text: String,
+}
+
+/// POST /api/admin/settings/tts-pinyin-rules/test —— 逐条跑注音提取规则，
+/// 返回每条的命中与提取值。用与朗读路径完全相同的引擎（fancy-regex + 守门校验），
+/// 前端所见即后端所得。
+pub async fn test_pinyin_rules(
+    app: web::Data<std::sync::Arc<AppState>>,
+    _admin: AdminAuth,
+    body: web::Json<PinyinRuleTestQuery>,
+) -> Result<web::Json<Value>, AppError> {
+    let rules = match &body.rules {
+        Some(value) => crate::services::tts::parse_pinyin_rules(value)?,
+        None => {
+            let raw = crate::services::settings_service::get_setting(
+                &app.db,
+                "tts_pinyin_rules",
+                Some(""),
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+            crate::services::tts::parse_pinyin_rules(&Value::String(raw))?
+        }
+    };
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in &rules {
+        let compiled = match fancy_regex::Regex::new(&rule.pattern) {
+            Ok(re) => re,
+            Err(e) => {
+                out.push(serde_json::json!({
+                    "name": rule.name, "enabled": rule.enabled,
+                    "matched": false, "value": null, "note": format!("编译失败：{e}"),
+                }));
+                continue;
+            }
+        };
+        // 与正式提取同口径：第一个捕获组，无捕获组取整体
+        let value = compiled
+            .captures(&body.text)
+            .ok()
+            .flatten()
+            .and_then(|caps| {
+                caps.get(1).or_else(|| caps.get(0)).map(|m| m.as_str().trim().to_string())
+            });
+        out.push(serde_json::json!({
+            "name": rule.name,
+            "enabled": rule.enabled,
+            "matched": value.is_some(),
+            "value": value,
+        }));
+    }
+    Ok(web::Json(serde_json::json!({ "results": out })))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/admin/settings", web::get().to(get_settings))
-        .route("/admin/settings", web::put().to(update_settings));
+        .route("/admin/settings", web::put().to(update_settings))
+        .route(
+            "/admin/settings/tts-pinyin-rules/test",
+            web::post().to(test_pinyin_rules),
+        );
 }

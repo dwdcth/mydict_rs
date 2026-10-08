@@ -9,3 +9,4 @@ frontend/dist
 # 测试语料（脚本生成，不入库）
 /testdata/
 .cache/
+/tts.wav

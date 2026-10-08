@@ -329,7 +329,7 @@ function isLoading(word: string, dictionaryId: number) {
 .phonetic {
   font-size: var(--text-sm);
   color: var(--color-text-secondary);
-  font-family: 'Noto Serif SC', Georgia, serif;
+  font-family: 'Noto Serif SC', 'Noto Serif CJK SC', 'Source Han Serif SC', 'WenQuanYi Zen Hei', Georgia, serif;
 }
 
 .head-favorite {

@@ -125,7 +125,23 @@ pub async fn get_all_settings(db: &DatabaseConnection, defaults: &Settings) -> R
         "tts_enabled": settings_service::get_bool_setting(db, "tts_enabled", false).await?,
         "tts_voice_zh": settings_service::get_setting(db, "tts_voice_zh", Some("zf_xiaoni")).await?,
         "tts_voice_en": settings_service::get_setting(db, "tts_voice_en", Some("af_heart")).await?,
+        // TTS 注音提取规则（数组形态给前端；库里的 JSON 字符串坏掉时降级为空）
+        "tts_pinyin_rules": get_pinyin_rules_as_value(db).await,
     }))
+}
+
+/// tts_pinyin_rules 库值（JSON 字符串）→ 数组 Value；解析失败给空数组
+async fn get_pinyin_rules_as_value(db: &DatabaseConnection) -> Value {
+    let raw = settings_service::get_setting(db, "tts_pinyin_rules", Some(""))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let parsed = crate::services::tts::parse_pinyin_rules(&serde_json::Value::String(raw));
+    match parsed {
+        Ok(rules) => serde_json::to_value(&rules).unwrap_or(serde_json::json!([])),
+        Err(_) => serde_json::json!([]),
+    }
 }
 
 pub async fn get_public_settings(db: &DatabaseConnection, defaults: &Settings, initialized: bool) -> Result<Value, sea_orm::DbErr> {
@@ -174,6 +190,20 @@ pub async fn update_settings(
 
     let mut changed = Map::new();
     for key in fields_present {
+        // 注音提取规则：数组（或 JSON 字符串）→ 校验（逐条编译正则）→ 存规范化 JSON
+        if key == "tts_pinyin_rules" {
+            let value = updates.get(key).cloned().unwrap_or(Value::Null);
+            let rules = crate::services::tts::parse_pinyin_rules(&value)?;
+            let normalized = serde_json::to_string(&rules).map_err(|e| {
+                AppError::internal("tts-pinyin-rules-serialize", e)
+            })?;
+            settings_service::set_setting(&state.db, key, &normalized).await?;
+            changed.insert(
+                key.clone(),
+                serde_json::to_value(&rules).unwrap_or(Value::Array(vec![])),
+            );
+            continue;
+        }
         if key == "online_dict_proxy" {
             let value = save_online_dict_proxy(
                 &state.db,

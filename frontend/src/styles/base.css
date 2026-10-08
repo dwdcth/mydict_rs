@@ -20,6 +20,15 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 原生表单控件不继承字体（UA 默认给 Arial），搜索框里的生僻字
+ * 会因此绕开 body 的 CJK/词典兜底字体栈显示成方框 */
+input,
+button,
+textarea,
+select {
+  font-family: inherit;
+}
+
 #app {
   min-height: 100vh;
 }

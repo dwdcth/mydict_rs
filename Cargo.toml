@@ -2,10 +2,16 @@
 resolver = "2"
 members = [
     "vendor/opendict",
+    "vendor/kokoro-micro",
     "crates/dict-parser",
     "crates/migration",
     "crates/server",
 ]
+
+# 上游 kokoro-micro 1.3.0 的本地 fork：暴露「拼音→语音」入口（服务端对
+# PUA 生僻字词条按词典注音兜底合成）。改动见 vendor/kokoro-micro/VENDOR-NOTES.md
+[patch.crates-io]
+kokoro-micro = { path = "vendor/kokoro-micro" }
 
 [workspace.package]
 edition = "2024"

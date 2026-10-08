@@ -10,6 +10,13 @@ export interface PublicSettings {
   search_hint_text: string
 }
 
+/** TTS 注音提取规则（生僻字读音兜底）：正则第一个捕获组 = 拼音 */
+export interface TtsPinyinRule {
+  name: string
+  pattern: string
+  enabled: boolean
+}
+
 export interface SystemSettings {
   open_access: boolean
   allow_registration: boolean
@@ -25,6 +32,10 @@ export interface SystemSettings {
   online_dict_proxy: string
   /** 启用的在线词典源 CSV；空串表示全部启用 */
   online_dict_sources: string
+  tts_enabled?: boolean
+  tts_voice_zh?: string
+  tts_voice_en?: string
+  tts_pinyin_rules?: TtsPinyinRule[]
 }
 
 export type SystemSettingsUpdate = Partial<SystemSettings>
