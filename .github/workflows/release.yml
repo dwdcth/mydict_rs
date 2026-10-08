@@ -104,14 +104,16 @@ jobs:
       # pyke 预编译 onnxruntime 引用 glibc>=2.38 的 __isoc23_* 符号；垫片
       # （scripts/isoc23_shim.c）转发到普通 strtol 族后，产物降到 glibc>=2.34，
       # Debian 12 / Ubuntu 22.04 可直接跑。macOS/Windows 符号没问题，不需要。
+      # 注意：ORT_LIB_LOCATION 只能在垫片 job 里存在——ort-sys 看到变量
+      # （哪怕空串）就会切换到「用户指定路径」策略，macOS/Windows 会找不到库。
       - name: Fetch ORT static lib + glibc shim
         if: matrix.ort_shim
-        run: make fetch-ort ORT_TARGET=${{ matrix.target }}
+        run: |
+          make fetch-ort ORT_TARGET=${{ matrix.target }}
+          echo "ORT_LIB_LOCATION=$GITHUB_WORKSPACE/.cache/onnxruntime-123" >> "$GITHUB_ENV"
 
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }} -p server
-        env:
-          ORT_LIB_LOCATION: ${{ matrix.ort_shim && format('{0}/.cache/onnxruntime-123', github.workspace) || '' }}
 
       - uses: actions/download-artifact@v4
         with:
