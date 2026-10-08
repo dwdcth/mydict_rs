@@ -173,7 +173,7 @@ export function fetchWordAudio(word: string, dictionaryId: number) {
 /** TTS 词语合成（edge→MP3 / kokoro→WAV blob）。v = 音频内容版本，服务端改合成参数后递增以击穿浏览器缓存 */
 export function fetchTtsBlob(text: string, lang?: string, voice?: string, engine?: string) {
   return request.get<BlobPart, BlobPart>('/dict/tts', {
-    params: { text, lang, voice, engine, v: 10 },
+    params: { text, lang, voice, engine, v: 11 },
     responseType: 'blob',
     timeout: 60_000,
   })

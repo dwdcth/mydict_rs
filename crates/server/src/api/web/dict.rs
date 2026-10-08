@@ -450,12 +450,12 @@ pub async fn word_tts(
         query.engine.as_deref(),
     )
     .await?;
+    // no-store：TTS 结果跟音色/引擎设置绑定，URL 里不含这些参数——浏览器缓存
+    // 会在改设置后回放旧嗓音（最多 24h）。服务端 moka 缓存 key 含引擎+音色，
+    // 命中是毫秒级的，浏览器层缓存没有价值
     Ok(HttpResponse::Ok()
         .content_type(audio.mime)
-        .insert_header((
-            actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=86400",
-        ))
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
         .body(audio.bytes.to_vec()))
 }
 
