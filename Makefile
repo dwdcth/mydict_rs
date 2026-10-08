@@ -49,3 +49,16 @@ fetch-ort:
 
 build-tts: fetch-ort
 	ORT_LIB_LOCATION=$(CURDIR)/$(ORT_DIR) cargo build
+
+# ── 本机 systemd 部署（~/.local/bin + ~/.local/share/mydict）─────────────
+deploy: build-release deploy-dist
+	install -m 755 target/release/mydict target/release/mydict-cli ~/.local/bin/
+	systemctl --user restart mydict
+	@echo "部署完成：systemctl --user status mydict"
+
+deploy-dist:
+	cd frontend && npm run build
+	rm -rf ~/.local/share/mydict/dist && cp -a frontend/dist ~/.local/share/mydict/dist
+
+build-release:
+	ORT_LIB_LOCATION=$(CURDIR)/$(ORT_DIR) cargo build --release -p server
