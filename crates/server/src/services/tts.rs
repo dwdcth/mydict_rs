@@ -192,9 +192,11 @@ pub struct SynthAudio {
 
 pub struct TtsState {
     /// 引擎（含失败闩：Err 为首次初始化的错误信息）。
-    /// RwLock<Option<..>> 而非 OnceCell：tts_engine 切回 edge 时要能卸载（take）。
+    /// RwLock<Option<..>> 而非 OnceCell：引擎要能卸载（take）。
     /// 内层 std::sync::Mutex：合成在 spawn_blocking 里持锁（tokio::Mutex 的 guard 跨不过边界）
     engine: std::sync::RwLock<Option<Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, String>>>,
+    /// kokoro 最后一次实际使用（unix 秒；加载与合成都会 touch）——空闲卸载的基准
+    kokoro_last_used: std::sync::atomic::AtomicU64,
     /// 初始化互斥（防并发重复下载）
     init_lock: tokio::sync::Mutex<()>,
     /// 合成串行信号量（CPU 密集，单并发足够且防内存翻倍）
@@ -207,6 +209,7 @@ impl TtsState {
     pub fn new() -> Self {
         Self {
             engine: std::sync::RwLock::new(None),
+            kokoro_last_used: std::sync::atomic::AtomicU64::new(0),
             init_lock: tokio::sync::Mutex::new(()),
             permit: tokio::sync::Semaphore::new(1),
             audio: MokaCache::builder()
@@ -229,6 +232,29 @@ impl TtsState {
         }
     }
 
+    /// 标记 kokoro 刚被使用（加载/合成时调用），空闲卸载据此计时
+    fn touch_kokoro(&self) {
+        self.kokoro_last_used.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// kokoro 空闲多久了（秒；从未使用 = u64::MAX 的一半以免溢出语义混乱）
+    fn kokoro_idle_secs(&self) -> u64 {
+        let last = self.kokoro_last_used.load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 {
+            return u64::MAX / 2;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().saturating_sub(last))
+            .unwrap_or(0)
+    }
+
     /// 触发 moka 维护任务：真正释放空闲过期音频占的内存（调度器周期调用）
     pub fn run_maintenance(&self) {
         self.audio.run_pending_tasks();
@@ -242,6 +268,22 @@ impl TtsState {
             Ok(mut guard) => guard.take().is_some(),
             Err(_) => false,
         }
+    }
+}
+
+/// kokoro 空闲自动卸载（调度器每 10 分钟调用）：
+/// 引擎是 edge（kokoro 只是 PUA 兜底）且超过 idle_secs 未合成 → 卸载模型。
+/// tts_engine=kokoro（主力引擎）时不卸——每次合成重载模型（秒级）不可接受。
+pub async fn unload_idle_kokoro(state: &AppState, idle_secs: u64) {
+    let engine_raw = get_voice_setting(&state.db, "tts_engine", "edge").await;
+    if engine_raw == "kokoro" {
+        return;
+    }
+    if state.tts.kokoro_idle_secs() < idle_secs {
+        return;
+    }
+    if state.tts.unload_kokoro() {
+        tracing::info!(idle_secs, "kokoro 兜底引擎空闲，已卸载释放模型内存");
     }
 }
 
@@ -644,6 +686,9 @@ async fn init_kokoro(
             Ok(engine) => {
                 let arc = Arc::new(std::sync::Mutex::new(engine));
                 state.tts.set_engine(Ok(arc.clone()));
+                // 刚加载视为「在用」：空闲计时从加载完成起算，别被下一个调度
+                // tick 立刻卸掉
+                state.tts.touch_kokoro();
                 Ok(arc)
             }
             Err(err) => {
@@ -669,6 +714,8 @@ async fn kokoro_synth(
         .acquire()
         .await
         .map_err(|e| AppError::internal("tts-semaphore", e))?;
+    // 空闲卸载的时间戳基准：真正用到引擎才算「在用」
+    state.tts.touch_kokoro();
     let text = word.to_string();
     let voice = voice.to_string();
     let single_char = is_single_hanzi(word);

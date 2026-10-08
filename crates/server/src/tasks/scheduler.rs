@@ -28,6 +28,9 @@ pub fn start(state: &Arc<AppState>) {
                     // 空闲内存回收：关闭超过 DICT_IDLE_UNLOAD_SECS 未查询的词典句柄，
                     // 释放资源/音频缓存里的过期项（空闲期无读写，moka 维护不会自己跑）
                     state.release_idle_memory();
+                    // kokoro 兜底引擎（tts_engine=edge 时被 PUA 词典触发加载）同窗口
+                    // 空闲则卸载模型；主力 kokoro 模式不卸
+                    crate::services::tts::unload_idle_kokoro(&state, state.cfg.dict_idle_unload_secs).await;
                 }
                 _ = day_ticker.tick() => {
                     if let Err(err) = cleanup_query_logs(&state).await {
