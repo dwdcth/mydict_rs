@@ -182,6 +182,12 @@ fn cut_at_pitch_bottom(samples: &mut [f32]) -> usize {
     cut_end
 }
 
+/// 合成产物：字节 + 内容类型（edge-tts → audio/mpeg；kokoro → audio/wav）
+pub struct SynthAudio {
+    pub bytes: Arc<Vec<u8>>,
+    pub mime: &'static str,
+}
+
 pub struct TtsState {
     /// 引擎（含失败闩：Err 为首次初始化的错误信息）。
     /// std::sync::Mutex：合成在 spawn_blocking 里持锁（tokio::Mutex 的 guard 跨不过边界）
@@ -190,8 +196,8 @@ pub struct TtsState {
     init_lock: tokio::sync::Mutex<()>,
     /// 合成串行信号量（CPU 密集，单并发足够且防内存翻倍）
     permit: tokio::sync::Semaphore,
-    /// word|voice → WAV 字节
-    audio: MokaCache<String, Arc<Vec<u8>>>,
+    /// word|voice|engine → 音频字节 + MIME（edge 出 MP3、kokoro 出 WAV）
+    audio: MokaCache<String, Arc<SynthAudio>>,
 }
 
 impl TtsState {
@@ -202,7 +208,7 @@ impl TtsState {
             permit: tokio::sync::Semaphore::new(1),
             audio: MokaCache::builder()
                 .max_capacity(TTS_CACHE_BYTES as u64)
-                .weigher(|_k, v: &Arc<Vec<u8>>| v.len() as u32)
+                .weigher(|_k, v: &Arc<SynthAudio>| v.bytes.len() as u32)
                 .build(),
         }
     }
@@ -248,13 +254,46 @@ async fn get_voice_setting(db: &DatabaseConnection, key: &str, default: &str) ->
     row.unwrap_or_else(|| default.to_string())
 }
 
-async fn tts_settings(db: &DatabaseConnection) -> Result<(bool, String, String), AppError> {
+/// kokoro 兜底嗓音（edge 失败回落 / 拼音兜底时用，不读设置——设置里的
+/// 嗓音名属于当前引擎，edge 名对 kokoro 无意义）
+const KOKORO_ZH_FALLBACK: &str = "zm_yunjian";
+const KOKORO_EN_FALLBACK: &str = "af_heart";
+const EDGE_ZH_DEFAULT: &str = "zh-CN-XiaoxiaoNeural";
+const EDGE_EN_DEFAULT: &str = "en-US-AriaNeural";
+
+async fn tts_settings(
+    db: &DatabaseConnection,
+) -> Result<(bool, String, String, String), AppError> {
     let enabled = crate::services::settings_service::get_bool_setting(db, "tts_enabled", false)
         .await
         .unwrap_or(false);
+    let engine_raw = get_voice_setting(db, "tts_engine", "edge").await;
+    let engine = if engine_raw == "kokoro" { engine_raw } else { "edge".to_string() };
     let zh = get_voice_setting(db, "tts_voice_zh", "zf_xiaoni").await;
     let en = get_voice_setting(db, "tts_voice_en", "af_heart").await;
-    Ok((enabled, zh, en))
+    Ok((enabled, engine, zh, en))
+}
+
+/// edge 嗓音名形态（zh-CN-XiaoxiaoNeural）：含 "Neural" 即视为合法
+fn is_edge_voice(v: &str) -> bool {
+    v.contains("Neural") && (2..=64).contains(&v.len())
+}
+
+/// edge 能不能直接读：有真汉字（基本区/扩展/兼容）或 ASCII 字母数字，且不含
+/// PUA 私有区字符（说文系字头字形 edge 读不出——整词混 PUA 都交给拼音兜底，
+/// 混着发 SSML 会被服务端吞掉返回空音频）
+fn edge_readable(word: &str) -> bool {
+    fn is_pua(c: char) -> bool {
+        matches!(c as u32,
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+    }
+    fn is_real_text(c: char) -> bool {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{2FFFF}')
+            || c.is_ascii_alphanumeric()
+    }
+    word.chars().any(is_real_text) && !word.chars().any(is_pua)
 }
 
 /// 音素串里有没有「模型会读出声」的东西：IPA 都在 U+E000 以下，而 PUA 私有区
@@ -434,126 +473,175 @@ async fn find_pronunciation_hint(db: &DatabaseConnection, word: &str) -> Option<
     None
 }
 
-/// 合成并返回 WAV 字节（24kHz mono 16-bit）
-pub async fn synthesize_wav(
-    state: &AppState,
-    word: &str,
-    lang_hint: Option<&str>,
-) -> Result<Arc<Vec<u8>>, AppError> {
-    synthesize_wav_with_voice(state, word, lang_hint, None).await
-}
-
-/// voice_override：试听指定嗓音（None = 按语言自动选设置里的嗓音）
-pub async fn synthesize_wav_with_voice(
+/// 合成并返回音频（edge → MP3 / kokoro → WAV，MIME 随产物）。
+/// `voice_override`/`engine_override`：管理端试听用；缺省按设置。
+pub async fn synthesize_audio(
     state: &AppState,
     word: &str,
     lang_hint: Option<&str>,
     voice_override: Option<&str>,
-) -> Result<Arc<Vec<u8>>, AppError> {
+    engine_override: Option<&str>,
+) -> Result<Arc<SynthAudio>, AppError> {
     let word = word.trim();
     if word.is_empty() || word.chars().count() > 500 {
         return Err(AppError::validation("文本为空或超过 500 字"));
     }
-    let (enabled, zh_voice, en_voice) = tts_settings(&state.db).await?;
+    let (enabled, engine_cfg, zh_voice, en_voice) = tts_settings(&state.db).await?;
     if !enabled {
         return Err(AppError::internal_msg(
             "TTS 未启用（管理后台 → 系统设置里开启）",
         ));
     }
+    let engine = match engine_override {
+        Some(e) if e == "edge" || e == "kokoro" => e.to_string(),
+        _ => engine_cfg,
+    };
+    // 嗓音：试听覆盖 > 按语言选设置值；再按引擎归一（edge 名/kokoro 名互不通用，
+    // 设置里存的是「当前引擎」的名字，切引擎时后台会一并换默认值）
     let voice = match voice_override {
-        Some(v) if (2..=32).contains(&v.len()) && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+        Some(v) if (2..=64).contains(&v.len())
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+        {
             v.to_string()
         }
         _ => pick_voice(word, lang_hint, &zh_voice, &en_voice),
     };
+    let zh = has_cjk(word) || lang_hint.map(|l| l.starts_with("zh")).unwrap_or(false);
+    let voice = if engine == "edge" && !is_edge_voice(&voice) {
+        if zh { EDGE_ZH_DEFAULT.to_string() } else { EDGE_EN_DEFAULT.to_string() }
+    } else if engine == "kokoro" && is_edge_voice(&voice) {
+        if zh { KOKORO_ZH_FALLBACK.to_string() } else { KOKORO_EN_FALLBACK.to_string() }
+    } else {
+        voice
+    };
 
-    // 引擎懒加载（首次会下载模型；失败闩住直到重启）
-    let engine = match state.tts.engine.get() {
-        Some(Ok(engine)) => engine.clone(),
-        Some(Err(msg)) => {
-            return Err(AppError::internal_msg(&format!(
-                "TTS 引擎不可用（初始化失败已闩住，重启服务后重试）：{msg}"
-            )))
-        }
-        None => {
-            let _guard = state.tts.init_lock.lock().await;
-            // 双检：等锁期间别的请求可能已初始化好
-            match state.tts.engine.get() {
-                Some(Ok(engine)) => engine.clone(),
-                Some(Err(msg)) => {
-                    return Err(AppError::internal_msg(&format!(
-                        "TTS 引擎不可用（初始化失败已闩住，重启服务后重试）：{msg}"
-                    )))
+    let cache_key = format!("{AUDIO_REV}|{engine}|{voice}|{word}");
+    if let Some(hit) = state.tts.audio.get(&cache_key) {
+        return Ok(hit);
+    }
+
+    // ── edge（在线，默认）：能读就直接合成；PUA/纯符号走拼音兜底 ──
+    if engine == "edge" {
+        if edge_readable(word) {
+            match crate::services::tts_edge::synthesize(word, &voice).await {
+                Ok(mp3) => {
+                    let out = Arc::new(SynthAudio {
+                        bytes: Arc::new(mp3),
+                        mime: "audio/mpeg",
+                    });
+                    state.tts.audio.insert(cache_key, out.clone());
+                    return Ok(out);
                 }
-                None => {
-                    // TtsEngine::new 是 async（模型不存在时内部异步下载 ~337MB）
-                    match kokoro_micro::TtsEngine::new().await {
-                        Ok(engine) => {
-                            let arc = Arc::new(std::sync::Mutex::new(engine));
-                            let _ = state.tts.engine.set(Ok(arc.clone()));
-                            arc
+                Err(err) => {
+                    tracing::warn!(error = %err, voice = %voice, "edge-tts 合成失败，尝试 kokoro 兜底");
+                    // 只回落到**已加载**的 kokoro（不偷偷触发 337MB 模型下载）
+                    if let Some(Ok(kokoro)) = state.tts.engine.get().cloned() {
+                        let voice2: &str = if zh { KOKORO_ZH_FALLBACK } else { KOKORO_EN_FALLBACK };
+                        let key2 = format!("{AUDIO_REV}|kokoro-fb|{voice2}|{word}");
+                        if let Some(hit) = state.tts.audio.get(&key2) {
+                            return Ok(hit);
                         }
-                        Err(err) => {
-                            let msg = format!("模型加载失败（首次使用需联网下载 ~337MB 到 ~/.cache/k/）：{err}");
-                            let _ = state.tts.engine.set(Err(msg.clone()));
-                            return Err(AppError::internal_msg(&msg));
-                        }
+                        let out = kokoro_synth(state, kokoro, word, voice2, None).await?;
+                        state.tts.audio.insert(key2, out.clone());
+                        return Ok(out);
                     }
+                    return Err(AppError::internal_msg(&format!(
+                        "edge-tts 失败：{err}（离线部署可在设置里把引擎切到 kokoro）"
+                    )));
                 }
             }
         }
-    };
+        // PUA 生僻字：只有 kokoro 的「拼音 → 音素」路径读得了词典注音
+        let hint = find_pronunciation_hint(&state.db, word).await.ok_or_else(|| {
+            AppError::validation("这个词读不出来：字库里没有它的读音，词典里也没找到注音")
+        })?;
+        let kokoro = init_kokoro(state).await?;
+        return kokoro_synth(state, kokoro, word, KOKORO_ZH_FALLBACK, Some(hint)).await;
+    }
 
-    let text = word.to_string();
-
-    // 字面转写不出读音（PUA 生僻字、表意描述符等）→ 用词典注音兜底。
-    // 探测用「自然语言」嗓音（管理员试听指定的嗓音不影响判定）；
-    // 兜底出来的必然是普通话拼音，合成必须用中文嗓音——英文嗓音读中文
-    // 音素会把 jin 扭成 jian 一类的怪音。缓存键用最终嗓音，放在定案之后。
-    // 注意：std Mutex guard 不能跨 await，探测锁在块内放下。
+    // ── kokoro（本地离线）──
+    let kokoro = init_kokoro(state).await?;
     let literal_ok = {
+        // 探测用「自然语言」嗓音（试听覆盖不影响判定）
         let probe_voice = pick_voice(word, lang_hint, &zh_voice, &en_voice);
-        let guard = engine
+        let guard = kokoro
             .lock()
             .map_err(|_| AppError::internal_msg("TTS 引擎锁中毒"))?;
         guard
-            .phonemize(&text, Some(&probe_voice))
+            .phonemize(word, Some(&probe_voice))
             .map(|ps| has_spoken_phonemes(&ps))
             .unwrap_or(false)
     };
     let pinyin_fallback = if literal_ok {
         None
     } else {
-        match find_pronunciation_hint(&state.db, word).await {
-            Some(p) => Some(p),
-            None => {
-                return Err(AppError::validation(
-                    "这个词读不出来：字库里没有它的读音，词典里也没找到注音",
-                ))
-            }
-        }
+        Some(find_pronunciation_hint(&state.db, word).await.ok_or_else(|| {
+            AppError::validation("这个词读不出来：字库里没有它的读音，词典里也没找到注音")
+        })?)
     };
-    let voice = if pinyin_fallback.is_some() {
-        zh_voice
-    } else {
-        voice
-    };
-
-    let cache_key = format!("{AUDIO_REV}|{voice}|{word}");
+    let voice = if pinyin_fallback.is_some() { KOKORO_ZH_FALLBACK.to_string() } else { voice };
+    let cache_key = format!("{AUDIO_REV}|{engine}|{voice}|{word}");
     if let Some(hit) = state.tts.audio.get(&cache_key) {
         return Ok(hit);
     }
+    let out = kokoro_synth(state, kokoro, word, &voice, pinyin_fallback).await?;
+    state.tts.audio.insert(cache_key, out.clone());
+    Ok(out)
+}
 
-    // CPU 密集：单并发信号量 + 阻塞线程
+/// kokoro 引擎懒加载（首次会下载模型 ~337MB；失败闩住直到重启）
+async fn init_kokoro(
+    state: &AppState,
+) -> Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, AppError> {
+    let latched = |msg: String| {
+        AppError::internal_msg(&format!(
+            "kokoro 引擎不可用（初始化失败已闩住，重启服务后重试）：{msg}"
+        ))
+    };
+    if let Some(Ok(engine)) = state.tts.engine.get() {
+        return Ok(engine.clone());
+    }
+    if let Some(Err(msg)) = state.tts.engine.get() {
+        return Err(latched(msg.clone()));
+    }
+    let _guard = state.tts.init_lock.lock().await;
+    // 双检：等锁期间别的请求可能已初始化好
+    match state.tts.engine.get() {
+        Some(Ok(engine)) => Ok(engine.clone()),
+        Some(Err(msg)) => Err(latched(msg.clone())),
+        None => match kokoro_micro::TtsEngine::new().await {
+            Ok(engine) => {
+                let arc = Arc::new(std::sync::Mutex::new(engine));
+                let _ = state.tts.engine.set(Ok(arc.clone()));
+                Ok(arc)
+            }
+            Err(err) => {
+                let msg = format!("模型加载失败（首次使用需联网下载 ~337MB 到 ~/.cache/k/）：{err}");
+                let _ = state.tts.engine.set(Err(msg.clone()));
+                Err(AppError::internal_msg(&msg))
+            }
+        },
+    }
+}
+
+/// kokoro 合成（CPU 密集：信号量串行 + 阻塞线程 + 静音裁剪/单字收尾）
+async fn kokoro_synth(
+    state: &AppState,
+    engine: Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>,
+    word: &str,
+    voice: &str,
+    pinyin_fallback: Option<String>,
+) -> Result<Arc<SynthAudio>, AppError> {
     let _permit = state
         .tts
         .permit
         .acquire()
         .await
         .map_err(|e| AppError::internal("tts-semaphore", e))?;
-
-    let engine_for_task = engine.clone();
+    let text = word.to_string();
+    let voice = voice.to_string();
     let single_char = is_single_hanzi(word);
+    let engine_for_task = engine.clone();
     let samples = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, String> {
         let engine_guard = engine_for_task
             .lock()
@@ -592,9 +680,10 @@ pub async fn synthesize_wav_with_voice(
     } else {
         trimmed.len()
     };
-    let wav = Arc::new(f32_to_wav(&trimmed[..final_len]));
-    state.tts.audio.insert(cache_key, wav.clone());
-    Ok(wav)
+    Ok(Arc::new(SynthAudio {
+        bytes: Arc::new(f32_to_wav(&trimmed[..final_len])),
+        mime: "audio/wav",
+    }))
 }
 
 /// 按能量裁首尾静音（阈值 0.6% 满幅；前后各留 60ms 自然余韵）
@@ -794,6 +883,17 @@ mod tests {
         // 不命中
         let re3 = fancy_regex::Regex::new(r"<x>(.+)</x>").unwrap();
         assert_eq!(extract_rule(&re3, html), None);
+    }
+
+    #[test]
+    fn edge_readable_classifies() {
+        assert!(edge_readable("你好"));
+        assert!(edge_readable("apple"));
+        assert!(edge_readable("\u{204C3}")); // 扩展 B 真汉字
+        assert!(!edge_readable("\u{F59A3}\u{F59A3}"), "PUA 走拼音兜底");
+        assert!(!edge_readable("\u{F59A3}好"), "混 PUA 整词兜底");
+        assert!(!edge_readable("⿰"), "表意描述符不可读");
+        assert!(!edge_readable("。，！"));
     }
 
     #[test]

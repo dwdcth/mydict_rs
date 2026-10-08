@@ -33,6 +33,7 @@ export interface SystemSettings {
   /** 启用的在线词典源 CSV；空串表示全部启用 */
   online_dict_sources: string
   tts_enabled?: boolean
+  tts_engine?: 'edge' | 'kokoro'
   tts_voice_zh?: string
   tts_voice_en?: string
   tts_pinyin_rules?: TtsPinyinRule[]

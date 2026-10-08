@@ -54,9 +54,10 @@ chrono-tz = "0.10"
 # 缓存 / 并发
 moka = { version = "0.12", features = ["sync"] }
 
-# 音频（.spx 词典语音解码：纯 Rust）
+# 音频（.spx 词典语音解码：纯 Rust；edge-tts 走 WebSocket）
 oxideav-speex = "0.0.10"
 ogg = "0.9"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 # 文本处理
 regex = "1"

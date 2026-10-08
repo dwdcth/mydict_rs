@@ -27,6 +27,7 @@ pub mod online_dict_service;
 pub mod stats_service;
 pub mod token_service;
 pub mod tts;
+pub mod tts_edge;
 pub mod ui_fonts;
 pub mod user_admin_service;
 pub mod user_auth_service;

@@ -46,6 +46,7 @@ moka.workspace = true
 regex.workspace = true
 fancy-regex.workspace = true
 oxideav-speex.workspace = true
+tokio-tungstenite.workspace = true
 ogg.workspace = true
 unicode-normalization.workspace = true
 opencc-rs.workspace = true

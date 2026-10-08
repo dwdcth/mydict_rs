@@ -23,8 +23,9 @@ const form = reactive({
   online_dict_enabled: false,
   random_browse_enabled: false,
   tts_enabled: false,
-  tts_voice_zh: 'zf_xiaoni',
-  tts_voice_en: 'af_heart',
+  tts_engine: 'edge' as 'edge' | 'kokoro',
+  tts_voice_zh: 'zh-CN-XiaoxiaoNeural',
+  tts_voice_en: 'en-US-AriaNeural',
   tts_pinyin_rules: [] as Array<{ name: string; pattern: string; enabled: boolean }>,
 })
 
@@ -63,6 +64,40 @@ const EN_VOICES = [
 ]
 const onlineSourceSelection = ref<string[]>([])
 
+// edge（微软在线）嗓音：Neural 系，名字即语言+人声
+const EDGE_ZH_VOICES = [
+  { value: 'zh-CN-XiaoxiaoNeural', label: '晓晓（女，自然，默认）' },
+  { value: 'zh-CN-XiaoyiNeural', label: '晓伊（女）' },
+  { value: 'zh-CN-YunjianNeural', label: '云健（男，浑厚）' },
+  { value: 'zh-CN-YunxiNeural', label: '云希（男）' },
+  { value: 'zh-CN-YunyangNeural', label: '云扬（男，播音）' },
+  { value: 'zh-CN-YunxiaNeural', label: '云夏（男，少年）' },
+  { value: 'zh-CN-liaoning-XiaobeiNeural', label: '晓北（女，东北话）' },
+  { value: 'zh-TW-HsiaoChenNeural', label: '曉臻（女，台湾腔）' },
+]
+const EDGE_EN_VOICES = [
+  { value: 'en-US-AriaNeural', label: 'Aria（美音女，默认）' },
+  { value: 'en-US-JennyNeural', label: 'Jenny（美音女）' },
+  { value: 'en-US-GuyNeural', label: 'Guy（美音男）' },
+  { value: 'en-US-EmmaMultilingualNeural', label: 'Emma（多语女）' },
+  { value: 'en-GB-SoniaNeural', label: 'Sonia（英音女）' },
+  { value: 'en-GB-RyanNeural', label: 'Ryan（英音男）' },
+]
+const zhVoiceOptions = computed(() => (form.tts_engine === 'edge' ? EDGE_ZH_VOICES : ZH_VOICES))
+const enVoiceOptions = computed(() => (form.tts_engine === 'edge' ? EDGE_EN_VOICES : EN_VOICES))
+
+/** 切引擎时嗓音名互不通用，重置成该引擎的默认 */
+function onEngineChange(engine: 'edge' | 'kokoro') {
+  form.tts_engine = engine
+  if (engine === 'edge') {
+    form.tts_voice_zh = 'zh-CN-XiaoxiaoNeural'
+    form.tts_voice_en = 'en-US-AriaNeural'
+  } else {
+    form.tts_voice_zh = 'zm_yunjian'
+    form.tts_voice_en = 'af_heart'
+  }
+}
+
 const previewingZh = ref(false)
 const previewingEn = ref(false)
 
@@ -77,10 +112,7 @@ async function previewVoice(voice: string) {
   const flag = isZh ? previewingZh : previewingEn
   flag.value = true
   try {
-    const blob = new Blob(
-      [await fetchTtsBlob(sample, undefined, voice)],
-      { type: 'audio/wav' },
-    )
+    const blob = new Blob([await fetchTtsBlob(sample, undefined, voice, form.tts_engine)])
     const url = URL.createObjectURL(blob)
     await useTtsPlayer().playUrl(url, `嗓音试听 ${voice}`)
     URL.revokeObjectURL(url)
@@ -323,11 +355,21 @@ async function testPinyinRules() {
             </span>
           </div>
         </el-form-item>
+        <el-form-item label="合成引擎">
+          <el-radio-group :model-value="form.tts_engine" @update:model-value="onEngineChange">
+            <el-radio-button value="edge">edge 在线（微软，默认）</el-radio-button>
+            <el-radio-button value="kokoro">kokoro 本地离线</el-radio-button>
+          </el-radio-group>
+          <p class="hint">
+            edge：微软神经嗓音，质量最好、不占内存，但需要出网（失败自动回落已加载的
+            kokoro）；kokoro：本地 CPU 合成，完全离线，首次使用需下载 ~337MB 模型。
+          </p>
+        </el-form-item>
         <div class="lang-row">
           <el-form-item label="中文嗓音">
             <div class="voice-row">
               <el-select v-model="form.tts_voice_zh" filterable allow-create>
-                <el-option v-for="v in ZH_VOICES" :key="v.value" :label="v.label" :value="v.value" />
+                <el-option v-for="v in zhVoiceOptions" :key="v.value" :label="v.label" :value="v.value" />
               </el-select>
               <el-button
                 :loading="previewingZh"
@@ -342,7 +384,7 @@ async function testPinyinRules() {
           <el-form-item label="英文嗓音">
             <div class="voice-row">
               <el-select v-model="form.tts_voice_en" filterable allow-create>
-                <el-option v-for="v in EN_VOICES" :key="v.value" :label="v.label" :value="v.value" />
+                <el-option v-for="v in enVoiceOptions" :key="v.value" :label="v.label" :value="v.value" />
               </el-select>
               <el-button
                 :loading="previewingEn"
@@ -355,9 +397,9 @@ async function testPinyinRules() {
           </el-form-item>
         </div>
         <p class="hint">
-          内嵌 Kokoro-82M（kokoro-micro）。首次使用会自动下载模型（约 337MB）到服务器的
-          ~/.cache/k/，下载与加载需要一点时间；之后结果按词缓存，重复播放零成本。
-          嗓音名决定语言（zf_*/zm_* 中文、af_*/bf_* 英语等九语内建）。
+          默认引擎 edge（微软在线神经嗓音，MP3 直出）；kokoro 为本地离线备选
+         （内嵌 Kokoro-82M，首次使用自动下载模型 ~337MB 到 ~/.cache/k/）。
+          结果按词×嗓音×引擎缓存，重复播放零成本。
         </p>
 
         <h3 class="sub-title">注音提取规则（生僻字读音兜底）</h3>

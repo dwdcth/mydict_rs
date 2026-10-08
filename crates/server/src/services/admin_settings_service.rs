@@ -39,6 +39,7 @@ const STR_KEYS: &[&str] = &[
     "site_name",
     "search_hint_text",
     "online_dict_sources",
+    "tts_engine",
     "tts_voice_zh",
     "tts_voice_en",
 ];
@@ -125,6 +126,8 @@ pub async fn get_all_settings(db: &DatabaseConnection, defaults: &Settings) -> R
         "tts_enabled": settings_service::get_bool_setting(db, "tts_enabled", false).await?,
         "tts_voice_zh": settings_service::get_setting(db, "tts_voice_zh", Some("zf_xiaoni")).await?,
         "tts_voice_en": settings_service::get_setting(db, "tts_voice_en", Some("af_heart")).await?,
+        // edge（微软在线，默认）| kokoro（本地离线）
+        "tts_engine": settings_service::get_setting(db, "tts_engine", Some("edge")).await?,
         // TTS 注音提取规则（数组形态给前端；库里的 JSON 字符串坏掉时降级为空）
         "tts_pinyin_rules": get_pinyin_rules_as_value(db).await,
     }))

@@ -120,7 +120,8 @@ async function play(text: string) {
   state.status = 'loading'
   state.text = trimmed
   try {
-    const blob = new Blob([await fetchTtsBlob(trimmed)], { type: 'audio/wav' })
+    // 直接用服务端返回的 blob（edge=audio/mpeg、kokoro=audio/wav）
+    const blob = new Blob([await fetchTtsBlob(trimmed)])
     if (seq !== playSeq) return // 已被停止/取代
     if (objectUrl) URL.revokeObjectURL(objectUrl)
     objectUrl = URL.createObjectURL(blob)

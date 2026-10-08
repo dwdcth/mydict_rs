@@ -417,6 +417,9 @@ pub struct TtsQuery {
     /// 指定嗓音试听（管理端预览用；缺省按语言用设置里的嗓音）
     #[serde(default)]
     pub voice: Option<String>,
+    /// 指定引擎试听（edge/kokoro；缺省用设置里的默认引擎）
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// GET /api/dict/tts —— 词语合成发音（kokoro-micro，WAV）。
@@ -439,20 +442,21 @@ pub async fn word_tts(
         .clone()
         .or_else(|| query.word.clone())
         .unwrap_or_default();
-    let wav = crate::services::tts::synthesize_wav_with_voice(
+    let audio = crate::services::tts::synthesize_audio(
         &app,
         &text,
         query.lang.as_deref(),
         query.voice.as_deref(),
+        query.engine.as_deref(),
     )
     .await?;
     Ok(HttpResponse::Ok()
-        .content_type("audio/wav")
+        .content_type(audio.mime)
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
             "public, max-age=86400",
         ))
-        .body(wav.to_vec()))
+        .body(audio.bytes.to_vec()))
 }
 
 /// GET /api/dict/ui-fonts.css —— 启用词典 @font-face 聚合（前端 UI 的 PUA
