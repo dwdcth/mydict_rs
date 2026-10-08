@@ -38,11 +38,11 @@ RUN touch crates/dict-parser/src/lib.rs crates/server/src/lib.rs crates/migratio
 RUN echo "${GIT_BRANCH}" > /version.txt
 
 FROM debian:12-slim
-# speexdec + lame：.spx→.mp3 按需转码；tzdata：TIMEZONE 设置；ca-certificates：在线词典出站
+# tzdata：TIMEZONE 设置；ca-certificates：在线词典出站。
+# .spx 词典语音由纯 Rust 解码（oxideav-speex），不再需要 speexdec/lame
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    speex lame tzdata ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -f /usr/bin/lame-*.1 2>/dev/null || true
+    tzdata ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=backend-build /build/target/release/mydict /app/mydict
 COPY --from=backend-build /build/target/release/mydict-cli /app/mydict-cli

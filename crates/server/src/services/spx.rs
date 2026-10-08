@@ -1,126 +1,104 @@
-//! Speex(.spx) → mp3 按需转码 —— 移植自 `app/services/spx_transcode.py`。
+//! Speex(.spx) → WAV 按需解码（纯 Rust：`ogg` 解容器 + `oxideav-speex` 解码）。
 //!
-//! 前端请求 x.mp3 未命中时服务端现转（speexdec → wav → lame），转好落盘下次直接命中。
-//! 参数逐字对齐 Python：`--quiet -m m -b 32 --resample 22.05`（单声道 32kbps 22.05kHz）。
+//! MDict 词典的人声发音常见 `.spx`（Ogg 封装的 Speex），浏览器放不了——
+//! 请求落进 `/dict-res` 时服务端现解成 WAV 返回，产物落盘（`x.spx.wav`）
+//! 下次直接命中。取代旧的外部工具链（speexdec → wav → lame → mp3）：
+//! 零外部运行时依赖，Windows 也能用，且省掉一层有损转码。
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
-use tokio::sync::Semaphore;
+use std::io::Cursor;
 
-const TIMEOUT_SECONDS: u64 = 15;
-/// 并发上限 2（对齐 Python BoundedSemaphore(2)）
-static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+/// 把 `.spx` 字节解成 WAV 字节（16-bit PCM，声道/采样率跟原文件）。
+/// 输入不是合法的 Ogg/Speex 时返回 Err（调用方按资源缺失处理）。
+pub fn decode_spx_to_wav(spx: &[u8]) -> Result<Vec<u8>, String> {
+    // 1) Ogg 解容器取包（MDict 的 .spx 是单逻辑流）
+    let mut reader = ogg::PacketReader::new(Cursor::new(spx));
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    while let Some(packet) = reader
+        .read_packet()
+        .map_err(|e| format!("Ogg 解包失败：{e}"))?
+    {
+        packets.push(packet.data);
+    }
+    if packets.is_empty() {
+        return Err("Ogg 里一个包都没有".to_string());
+    }
 
-fn semaphore() -> &'static Semaphore {
-    SEMAPHORE.get_or_init(|| Semaphore::new(2))
+    // 2) 首包 = Speex 头（SPEEX_MAGIC + 13 个 LE i32）
+    let header =
+        oxideav_speex::SpeexHeader::parse(&packets[0]).map_err(|e| format!("Speex 头无效：{e}"))?;
+    let mut decoder = oxideav_speex::SpeexStreamDecoder::for_header(&header)
+        .map_err(|e| format!("Speex 流初始化失败：{e}"))?;
+    let rate = decoder.output_rate_hz();
+    let channels = header.nb_channels.max(1) as u16;
+
+    // 3) 第二个包是注释包（跳过），其余都是音频帧
+    let mut pcm: Vec<i16> = Vec::new();
+    for packet in packets.iter().skip(1) {
+        match decoder.decode_packet_pcm_i16(packet) {
+            Ok(samples) => pcm.extend(samples),
+            // 个别坏包跳过（丢一帧比整条音频 404 好）
+            Err(_) => continue,
+        }
+    }
+    if pcm.is_empty() {
+        return Err("没有解出任何音频帧".to_string());
+    }
+
+    Ok(pcm_to_wav(&pcm, rate, channels))
 }
 
-/// speexdec 与 lame 是否都可用（缓存 which 结果；任一缺失则功能整体关闭）
-pub fn tools_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        which("speexdec").is_some() && which("lame").is_some()
-    })
+/// f32→WAV 的姊妹实现：i16 PCM 直接落字节
+fn pcm_to_wav(pcm: &[i16], rate: u32, channels: u16) -> Vec<u8> {
+    let data_len = pcm.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes()); // 字节率
+    out.extend_from_slice(&(channels * 2).to_le_bytes()); // 块对齐
+    out.extend_from_slice(&16u16.to_le_bytes()); // 位深
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
 }
 
-fn which(tool: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(tool);
-        if candidate.is_file() {
-            // 可执行位检查（Unix）
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&candidate) {
-                    if meta.permissions().mode() & 0o111 == 0 {
-                        continue;
-                    }
-                }
-            }
-            return Some(candidate);
-        }
-    }
-    None
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 把 source(.spx) 转成同名 .mp3（落源文件旁边），成功返回 mp3 路径。
-/// 工具缺失/超时/失败返回 None；排队期间已被别的请求转好则直接复用。
-pub async fn transcode_to_mp3(source: &Path) -> Option<PathBuf> {
-    if !tools_available() {
-        return None;
+    /// 夹具由 gen_sine_fixture（--ignored 跑一次）生成，产物入库
+    #[test]
+    fn decodes_fixture() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.spx");
+        let spx = std::fs::read(path).expect("夹具缺失（先跑 gen_sine_fixture --ignored）");
+        let wav = decode_spx_to_wav(&spx).expect("解码失败");
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+        assert_eq!(rate, 8000, "窄带 8kHz");
+        // 2 秒 ± 容差（帧对齐）
+        let samples = (wav.len() - 44) / 2;
+        assert!(samples > 15000 && samples < 17000, "样本数 {samples}");
+        // 不是全静音
+        let peak = wav[44..]
+            .chunks(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1000, "峰值 {peak}");
     }
-    let target = source.with_extension("mp3");
-    if target.is_file() {
-        return Some(target);
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(decode_spx_to_wav(b"not an ogg file").is_err());
+        assert!(decode_spx_to_wav(b"").is_err());
     }
-    let _permit = semaphore().acquire().await.ok()?;
-    // 拿到信号量后再查一次：排队期间可能已被转好
-    if target.is_file() {
-        return Some(target);
-    }
-    let source = source.to_path_buf();
-    let target2 = target.clone();
-    // 中转目录建在源文件父目录（.spx- 前缀），成功后 rename 原子落位；
-    // 放在超时块外创建——超时取消后外层还能清理（对齐 Python with 上下文的清理保证）
-    let parent = source.parent()?.to_path_buf();
-    let work = parent.join(format!(".spx-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::create_dir_all(&work).await.ok()?;
-    let work_outer = work.clone();
-    let result = tokio::time::timeout(Duration::from_secs(TIMEOUT_SECONDS), async move {
-        let wav = work.join("out.wav");
-        let mp3_tmp = work.join("out.mp3");
-        async fn cleanup(work: &Path) {
-            let _ = tokio::fs::remove_dir_all(work).await;
-        }
-        // speexdec input.spx out.wav
-        let status = tokio::process::Command::new("speexdec")
-            .arg(&source)
-            .arg(&wav)
-            .status()
-            .await;
-        if !matches!(status, Ok(s) if s.success()) {
-            cleanup(&work).await;
-            return None;
-        }
-        // lame --quiet -m m -b 32 --resample 22.05 wav mp3
-        let status = tokio::process::Command::new("lame")
-            .arg("--quiet")
-            .arg("-m")
-            .arg("m")
-            .arg("-b")
-            .arg("32")
-            .arg("--resample")
-            .arg("22.05")
-            .arg(&wav)
-            .arg(&mp3_tmp)
-            .status()
-            .await;
-        if !matches!(status, Ok(s) if s.success()) {
-            cleanup(&work).await;
-            return None;
-        }
-        // 对齐 Python：产物必须非空（speexdec 对坏输入可能成功退出但产出 0 字节）
-        match tokio::fs::metadata(&mp3_tmp).await {
-            Ok(meta) if meta.len() > 0 => {}
-            _ => {
-                cleanup(&work).await;
-                return None;
-            }
-        }
-        if tokio::fs::rename(&mp3_tmp, &target2).await.is_err() {
-            cleanup(&work).await;
-            return None;
-        }
-        cleanup(&work).await;
-        Some(target2)
-    })
-    .await;
-    let outcome = result.ok().flatten();
-    if outcome.is_none() {
-        // 超时取消/失败：兜底清理中转目录（内部路径通常已自清，这里保证幂等）
-        let _ = tokio::fs::remove_dir_all(&work_outer).await;
-    }
-    outcome
 }

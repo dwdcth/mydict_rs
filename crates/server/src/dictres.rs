@@ -86,6 +86,14 @@ pub async fn dict_resource(
         );
     }
 
+    // .spx 直连：浏览器播不了 Ogg/Speex，解成 WAV 返回（缓存 x.spx.wav；
+    // 解码失败则继续往下走原样返回——下载场景仍可用）
+    if lower.ends_with(".spx") {
+        if let Some(resp) = spx_as_wav_response(&app, &req, dictionary_id, &normalized).await {
+            return resp;
+        }
+    }
+
     // 1) 磁盘 res/（兄弟文件/历史解包/转码产物）：大小写不敏感解析放阻塞线程。
     //    按候选链依次试：多次 percent-decode、simplified/ 前缀、_simplified 后缀
     //    （词典兼容容错——部分词典引用与 mdd 键的编码/目录约定不一致）
@@ -128,71 +136,99 @@ pub async fn dict_resource(
         );
     }
 
-    // 3) .mp3 缺而 .spx 在（res/ 或 .mdd）→ 现场转码
+    // 3) .mp3 缺而 .spx 在（res/ 或 .mdd）→ 纯 Rust 解码成 WAV 返回
+    //    （前端播放器拿到的 Content-Type 是 audio/wav，URL 的 .mp3 后缀无所谓）
     if normalized.to_lowercase().ends_with(".mp3") {
         let spx_rel = format!("{}.spx", &normalized[..normalized.len() - 4]);
-        let source = match res::resolve_resource_file(&res_dir, &spx_rel) {
-            Some(path) => Some(path),
-            None => {
-                // 从 .mdd 读出 .spx 字节 → 唯一临时名（避免并发互踩）→ 转码
-                match lookup_resource_with_candidates(&app, dictionary_id, &spx_rel).await {
-                    Some(bytes) => {
-                        let res_dir = res_dir.clone();
-                        match tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {
-                            std::fs::create_dir_all(&res_dir)?;
-                            let tmp = res_dir.join(format!(
-                                ".spx-src-{}-{}",
-                                std::process::id(),
-                                uuid::Uuid::new_v4().simple()
-                            ));
-                            std::fs::write(&tmp, bytes.as_slice())?;
-                            Ok(tmp)
-                        })
-                        .await
-                        {
-                            Ok(Ok(tmp)) => Some(tmp),
-                            _ => None,
-                        }
-                    }
-                    None => None,
-                }
-            }
-        };
-        if let Some(source) = source {
-            if let Some(mp3) = crate::services::spx::transcode_to_mp3(&source).await {
-                // 临时 .spx 用完即删；产物落到**请求名**（下次直接磁盘命中，对齐 Python
-                // 导入期解包后转码落正确名字的缓存语义）
-                let _ = tokio::fs::remove_file(&source).await;
-                let normalized2 = normalized.clone();
-                let res_dir2 = res_dir.clone();
-                let mp3_fallback = mp3.clone();
-                let cached = tokio::task::spawn_blocking(move || -> Option<PathBuf> {
-                    let bytes = std::fs::read(&mp3).ok()?;
-                    // mp3 临时产物（.spx-src-*.mp3）也一并清掉
-                    let _ = std::fs::remove_file(&mp3);
-                    res::write_resource(&res_dir2, &normalized2, &bytes, false)
-                        .ok()
-                        .map(|_| res_dir2.join(normalized2.trim_start_matches('/')))
-                })
-                .await
-                .ok()
-                .flatten();
-                // 落盘成功用缓存名，失败回退临时产物
-                let serve_path = cached.unwrap_or(mp3_fallback);
-                let media_type = res::resource_media_type(&serve_path);
-                return match NamedFile::open(&serve_path) {
-                    Ok(file) => dict_res_headers(
-                        file.disable_content_disposition()
-                            .set_content_type(parse_mime(media_type))
-                            .into_response(&req),
-                    ),
-                    Err(_) => HttpResponse::NotFound().finish(),
-                };
-            }
+        if let Some(resp) = spx_as_wav_response(&app, &req, dictionary_id, &spx_rel).await {
+            return resp;
         }
     }
 
     HttpResponse::NotFound().finish()
+}
+
+/// 把一条 .spx 资源按 WAV 返回（缓存名 `x.spx.wav`，不占真实 .wav 的名字空间）。
+/// 缓存命中直接发文件；否则从 res/ 或 .mdd 取 .spx 字节 → 解码 → 尽力落盘。
+/// 解码失败返回 None（调用方按 404 或原样回落处理）。
+async fn spx_as_wav_response(
+    app: &std::sync::Arc<AppState>,
+    req: &HttpRequest,
+    dictionary_id: i32,
+    spx_rel: &str,
+) -> Option<HttpResponse> {
+    let res_dir = PathBuf::from(&app.cfg.dictionary_storage_path)
+        .join(dictionary_id.to_string())
+        .join("res");
+    let wav_rel = format!("{spx_rel}.wav");
+
+    // 1) 缓存命中（大小写不敏感链，与其他资源同口径）
+    let res_dir2 = res_dir.clone();
+    let wav_rel2 = wav_rel.clone();
+    let cached = tokio::task::spawn_blocking(move || {
+        dict_parser::resources::resource_candidates(&wav_rel2)
+            .iter()
+            .find_map(|c| dict_parser::resources::resolve_resource_file(&res_dir2, c))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(path) = cached {
+        return Some(match NamedFile::open(&path) {
+            Ok(file) => dict_res_headers(
+                file.disable_content_disposition()
+                    .set_content_type(parse_mime("audio/wav"))
+                    .into_response(req),
+            ),
+            Err(_) => HttpResponse::NotFound().finish(),
+        });
+    }
+
+    // 2) 取 .spx 源字节：res/ 磁盘 → .mdd
+    let spx_bytes = if let Some(path) =
+        res::resolve_resource_file(&res_dir, spx_rel)
+    {
+        tokio::task::spawn_blocking(move || std::fs::read(path)).await.ok()?.ok()?
+    } else {
+        lookup_resource_with_candidates(app, dictionary_id, spx_rel).await?.to_vec()
+    };
+
+    // 3) 解码（纯 CPU）+ 尽力落盘缓存
+    let wav = tokio::task::spawn_blocking(move || crate::services::spx::decode_spx_to_wav(&spx_bytes))
+        .await
+        .ok()?
+        .ok()?;
+    let res_dir3 = res_dir.clone();
+    let wav_bytes = wav.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        res::write_resource(&res_dir3, &wav_rel, &wav_bytes, false)
+            .ok()
+            .map(|_| true)
+    })
+    .await
+    .ok()
+    .flatten();
+    if written == Some(true) {
+        // 重开缓存文件（带 ETag/Last-Modified 等文件响应头）
+        let candidates = res::resource_candidates(&format!("{spx_rel}.wav"));
+        for candidate in &candidates {
+            if let Some(path) = res::resolve_resource_file(&res_dir, candidate) {
+                return Some(match NamedFile::open(&path) {
+                    Ok(file) => dict_res_headers(
+                        file.disable_content_disposition()
+                            .set_content_type(parse_mime("audio/wav"))
+                            .into_response(req),
+                    ),
+                    Err(_) => HttpResponse::NotFound().finish(),
+                });
+            }
+        }
+    }
+    Some(dict_res_headers(
+        HttpResponse::Ok()
+            .content_type(parse_mime("audio/wav"))
+            .body(wav),
+    ))
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {

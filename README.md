@@ -76,4 +76,4 @@ cd frontend && npm run build  # 前端构建到 frontend/dist（STATIC_DIR 指�
 
 - Rust ≥ 1.98（mdictlib 依赖；`rust-toolchain.toml` 已锁定）
 - 构建 OpenCC FFI 需要 clang + cmake（Docker 镜像已包含）
-- 运行镜像需要 speexdec + lame（.spx 发音转码）、tzdata
+- .spx 词典语音由纯 Rust 解码（oxideav-speex），运行镜像只需 tzdata

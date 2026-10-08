@@ -54,6 +54,10 @@ chrono-tz = "0.10"
 # 缓存 / 并发
 moka = { version = "0.12", features = ["sync"] }
 
+# 音频（.spx 词典语音解码：纯 Rust）
+oxideav-speex = "0.0.10"
+ogg = "0.9"
+
 # 文本处理
 regex = "1"
 fancy-regex = "0.19"
