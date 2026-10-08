@@ -1,0 +1,135 @@
+# 打 tag 触发的多平台发布构建。
+#
+# 触发：git tag v* 推送（例如 `git tag v0.1.0 && git push origin v0.1.0`），
+# 产物挂在同名 GitHub Release 上。日常 push 到分支不编译（按需再开 CI 校验）。
+#
+# 平台：linux x86_64 / linux aarch64（arm64 原生 runner）/ macOS arm64 /
+#       macOS x86_64（arm64 runner 上交叉）/ Windows x86_64
+#
+# ort（onnxruntime，TTS 依赖）在各平台都走 ort-sys 默认的预编译库下载，
+# 不需要本仓库 .cache/ 里的本地垫片（那是 Debian 12 / glibc 2.36 的开发机
+# 专用方案；CI 的 ubuntu-24.04 是 glibc 2.39，符号齐全）。
+# 运行期外部依赖：.spx 转 .mp3 需要 speexdec 与 lame（发行包里有说明）。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 前端只建一次，各平台打包时带上
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 3
+
+  build:
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: mydict-x86_64-linux.tar.gz
+            run_tests: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: mydict-aarch64-linux.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: mydict-aarch64-macos.tar.gz
+          # arm64 runner 上用 Xcode 工具链交叉出 x86_64（Intel runner 逐步退役）
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: mydict-x86_64-macos.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: mydict-x86_64-windows.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不指定 toolchain：遵循仓库 rust-toolchain.toml 钉的版本
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install archive tool (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install zip -y --no-progress
+
+      # 只在 linux x86_64 上跑一遍测试（迁移/契约/解析语料，模型类 #[ignore] 自动跳过）
+      - name: Test
+        if: matrix.run_tests
+        run: cargo test --workspace --quiet
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }} -p server
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: stage/dist
+
+      - name: Stage package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          stage="mydict-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/mydict" "$stage/"
+          cp "target/${{ matrix.target }}/release/mydict-cli" "$stage/"
+          cp -r stage/dist "$stage/dist"
+          cp README.md .env.example "$stage/" 2>/dev/null || true
+          tar czf "${{ matrix.archive }}" "$stage"
+          echo "## ${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh "${{ matrix.archive }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "mydict-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mydict.exe" "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/mydict-cli.exe" "$stage/"
+          Copy-Item -Recurse -Force "stage/dist" "$stage/dist"
+          Copy-Item "README.md" "$stage/" -ErrorAction SilentlyContinue
+          Copy-Item ".env.example" "$stage/" -ErrorAction SilentlyContinue
+          zip -r "${{ matrix.archive }}" "$stage"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}
+          fail_on_unmatched_files: true
