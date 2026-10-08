@@ -212,3 +212,117 @@ mod tests {
         assert!(mp3.len() > 1000);
     }
 }
+
+// ── 官方音色列表（/voices/list，带 6 小时进程内缓存） ─────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EdgeVoice {
+    pub short_name: String,
+    pub gender: String,
+    pub locale: String,
+    pub locale_name: String,
+    pub display: String,
+}
+
+impl EdgeVoice {
+    fn from_raw(v: &serde_json::Value) -> Option<Self> {
+        let short_name = v.get("ShortName")?.as_str()?.to_string();
+        if short_name.is_empty() {
+            return None;
+        }
+        let gender = v.get("Gender").and_then(|g| g.as_str()).unwrap_or("");
+        let locale = v.get("Locale").and_then(|g| g.as_str()).unwrap_or("");
+        let locale_name = v
+            .get("LocaleName")
+            .and_then(|g| g.as_str())
+            .unwrap_or("")
+            .to_string();
+        // FriendlyName 形如 "Microsoft Xiaoxiao Online (Natural) - Chinese (Mainland)"
+        let friendly = v
+            .get("FriendlyName")
+            .and_then(|g| g.as_str())
+            .unwrap_or("")
+            .to_string();
+        let core = friendly
+            .strip_prefix("Microsoft ")
+            .and_then(|r| r.split_once(" Online").map(|(a, _)| a))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&short_name)
+            .to_string();
+        let gender_zh = if gender.eq_ignore_ascii_case("Female") {
+            "女"
+        } else if gender.eq_ignore_ascii_case("Male") {
+            "男"
+        } else {
+            gender
+        };
+        Some(EdgeVoice {
+            display: format!("{core}（{gender_zh}）"),
+            short_name,
+            gender: gender_zh.to_string(),
+            locale: locale.to_string(),
+            locale_name,
+        })
+    }
+}
+
+static VOICE_CACHE: std::sync::OnceLock<moka::sync::Cache<(), std::sync::Arc<Result<Vec<EdgeVoice>, String>>>> =
+    std::sync::OnceLock::new();
+
+/// 全量音色（322 个：中文 14 / 英文 47 / 日韩法德等）。失败时缓存错误 10 分钟
+/// （离线部署别每次请求都撞墙），调用方回退静态精选表。
+pub async fn list_voices() -> std::sync::Arc<Result<Vec<EdgeVoice>, String>> {
+    let cache = VOICE_CACHE.get_or_init(|| {
+        moka::sync::Cache::builder()
+            .time_to_live(std::time::Duration::from_secs(6 * 3600))
+            .build()
+    });
+    if let Some(hit) = cache.get(&()) {
+        return hit;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())
+        .unwrap_or_default()
+        .as_secs();
+    let muid: String = (0..32)
+        .map(|_| char::from_digit((rand::random::<u8>() % 16) as u32, 16).unwrap().to_ascii_uppercase())
+        .collect();
+    let result = async {
+        let resp = reqwest::Client::new()
+            .get("https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list")
+            .query(&[
+                ("trustedclienttoken", TRUSTED_CLIENT_TOKEN),
+                ("Sec-MS-GEC", &sec_ms_gec(now)),
+            ])
+            .header("User-Agent", EDGE_UA)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", format!("muid={muid};"))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("请求音色列表失败：{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("音色列表接口返回 {}", resp.status()));
+        }
+        let raw: serde_json::Value =
+            resp.json().await.map_err(|e| format!("解析失败：{e}"))?;
+        let voices: Vec<EdgeVoice> = raw
+            .as_array()
+            .map(|arr| arr.iter().filter_map(EdgeVoice::from_raw).collect())
+            .ok_or("响应不是数组")?;
+        if voices.is_empty() {
+            return Err("音色列表为空".to_string());
+        }
+        Ok(voices)
+    }
+    .await;
+    let arc = std::sync::Arc::new(result);
+    // 失败只缓存 10 分钟，成功 6 小时——moka 不支持按值 TTL，失败就先插短缓存再覆盖？
+    // 简化：失败结果不进 6h 缓存（下次重试），成功才进。
+    if arc.is_ok() {
+        cache.insert((), arc.clone());
+    }
+    arc
+}

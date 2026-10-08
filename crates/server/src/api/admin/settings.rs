@@ -95,11 +95,28 @@ pub async fn test_pinyin_rules(
     Ok(web::Json(serde_json::json!({ "results": out })))
 }
 
+/// GET /api/admin/settings/tts-edge-voices —— edge-tts 官方全量音色（322 个，
+/// 服务端缓存 6 小时；离线失败时前端回退内置精选表）
+pub async fn tts_edge_voices(
+    _admin: AdminAuth,
+) -> Result<web::Json<Value>, AppError> {
+    match crate::services::tts_edge::list_voices().await.as_ref() {
+        Ok(voices) => Ok(web::Json(serde_json::json!({ "voices": voices }))),
+        Err(err) => Err(AppError::internal_msg(&format!(
+            "获取 edge 音色列表失败：{err}（可先用内置精选表）"
+        ))),
+    }
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/admin/settings", web::get().to(get_settings))
         .route("/admin/settings", web::put().to(update_settings))
         .route(
             "/admin/settings/tts-pinyin-rules/test",
             web::post().to(test_pinyin_rules),
+        )
+        .route(
+            "/admin/settings/tts-edge-voices",
+            web::get().to(tts_edge_voices),
         );
 }

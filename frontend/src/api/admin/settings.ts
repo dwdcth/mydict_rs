@@ -28,3 +28,16 @@ export function testPinyinRules(rules: TtsPinyinRule[], text: string) {
     { rules, text },
   )
 }
+
+export interface EdgeVoice {
+  short_name: string
+  gender: string
+  locale: string
+  locale_name: string
+  display: string
+}
+
+/** edge-tts 官方全量音色（服务端缓存 6h；离线部署会失败，调用方回退精选表） */
+export function listEdgeVoices() {
+  return request.get<never, { voices: EdgeVoice[] }>('/admin/settings/tts-edge-voices')
+}

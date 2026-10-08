@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as settingsApi from '../../api/admin/settings'
 import { fetchTtsBlob } from '../../api/dict'
+import { listEdgeVoices, type EdgeVoice } from '../../api/admin/settings'
 import { useTtsPlayer } from '../../utils/ttsPlayer'
 import RefreshButton from '../../components/admin/RefreshButton.vue'
 
@@ -83,8 +84,60 @@ const EDGE_EN_VOICES = [
   { value: 'en-GB-SoniaNeural', label: 'Sonia（英音女）' },
   { value: 'en-GB-RyanNeural', label: 'Ryan（英音男）' },
 ]
-const zhVoiceOptions = computed(() => (form.tts_engine === 'edge' ? EDGE_ZH_VOICES : ZH_VOICES))
-const enVoiceOptions = computed(() => (form.tts_engine === 'edge' ? EDGE_EN_VOICES : EN_VOICES))
+// edge 全量音色（远端拉取，失败回退精选表）：中文/英文分组 + 其他语言
+const edgeVoices = ref<EdgeVoice[] | null>(null)
+const edgeVoicesLoaded = ref(false)
+
+async function loadEdgeVoices() {
+  if (edgeVoicesLoaded.value) return
+  try {
+    const res = await listEdgeVoices()
+    edgeVoices.value = res.voices
+  } catch {
+    edgeVoices.value = null // 离线：回退精选表
+  } finally {
+    edgeVoicesLoaded.value = true
+  }
+}
+
+function edgeGroup(localePrefix: string) {
+  const list = (edgeVoices.value ?? []).filter((v) => v.locale.startsWith(localePrefix))
+  return list.map((v) => ({
+    value: v.short_name,
+    label: `${v.display} · ${v.locale_name}`,
+  }))
+}
+
+const zhVoiceOptions = computed(() => {
+  if (form.tts_engine !== 'edge') return ZH_VOICES
+  if (edgeVoices.value && edgeVoices.value.length) {
+    return [
+      ...edgeGroup('zh-CN'),
+      ...edgeGroup('zh-HK'),
+      ...edgeGroup('zh-TW'),
+    ]
+  }
+  return EDGE_ZH_VOICES
+})
+
+const enVoiceOptions = computed(() => {
+  if (form.tts_engine !== 'edge') return EN_VOICES
+  if (edgeVoices.value && edgeVoices.value.length) {
+    return [...edgeGroup('en-US'), ...edgeGroup('en-GB'), ...edgeGroup('en-AU'), ...edgeGroup('en-')]
+  }
+  return EDGE_EN_VOICES
+})
+
+/** 其他语言的完整列表（日/韩/法/德/俄/西等，下拉全量可搜索） */
+const edgeOtherVoices = computed(() => {
+  const list = (edgeVoices.value ?? []).filter(
+    (v) => !v.locale.startsWith('zh') && !v.locale.startsWith('en'),
+  )
+  return list.map((v) => ({
+    value: v.short_name,
+    label: `${v.display} · ${v.locale_name}（${v.locale}）`,
+  }))
+})
 
 /** 切引擎时嗓音名互不通用，重置成该引擎的默认 */
 function onEngineChange(engine: 'edge' | 'kokoro') {
@@ -156,7 +209,10 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadEdgeVoices()
+})
 
 async function save() {
   if (!onlineSourceSelection.value.length) {
@@ -361,15 +417,38 @@ async function testPinyinRules() {
             <el-radio-button value="kokoro">kokoro 本地离线</el-radio-button>
           </el-radio-group>
           <p class="hint">
-            edge：微软神经嗓音，质量最好、不占内存，但需要出网（失败自动回落已加载的
-            kokoro）；kokoro：本地 CPU 合成，完全离线，首次使用需下载 ~337MB 模型。
+            edge：微软神经嗓音（官方全量 322 个，下拉可搜索；离线时显示精选表），
+            质量最好、不占内存，但需要出网（失败自动回落已加载的 kokoro）；
+            kokoro：本地 CPU 合成，完全离线，首次使用需下载 ~337MB 模型。
           </p>
         </el-form-item>
         <div class="lang-row">
           <el-form-item label="中文嗓音">
             <div class="voice-row">
-              <el-select v-model="form.tts_voice_zh" filterable allow-create>
-                <el-option v-for="v in zhVoiceOptions" :key="v.value" :label="v.label" :value="v.value" />
+              <el-select
+                v-model="form.tts_voice_zh"
+                filterable
+                allow-create
+                :loading="!edgeVoicesLoaded && form.tts_engine === 'edge'"
+                placeholder="搜索或输入任意 edge 嗓音名"
+              >
+                <el-option
+                  v-for="v in zhVoiceOptions"
+                  :key="v.value"
+                  :label="v.label"
+                  :value="v.value"
+                />
+                <el-option-group
+                  v-if="form.tts_engine === 'edge' && edgeOtherVoices.length"
+                  label="多语种（日韩法德俄西等）"
+                >
+                  <el-option
+                    v-for="v in edgeOtherVoices"
+                    :key="v.value"
+                    :label="v.label"
+                    :value="v.value"
+                  />
+                </el-option-group>
               </el-select>
               <el-button
                 :loading="previewingZh"
@@ -383,7 +462,13 @@ async function testPinyinRules() {
           </el-form-item>
           <el-form-item label="英文嗓音">
             <div class="voice-row">
-              <el-select v-model="form.tts_voice_en" filterable allow-create>
+              <el-select
+                v-model="form.tts_voice_en"
+                filterable
+                allow-create
+                :loading="!edgeVoicesLoaded && form.tts_engine === 'edge'"
+                placeholder="搜索或输入任意 edge 嗓音名"
+              >
                 <el-option v-for="v in enVoiceOptions" :key="v.value" :label="v.label" :value="v.value" />
               </el-select>
               <el-button
