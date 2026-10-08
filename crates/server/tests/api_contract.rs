@@ -1564,6 +1564,127 @@ async fn flashcards_fsrs_full_flow() {
         .all(|item| item["in_review"] == false));
 }
 
+/// 回归：闪卡列表分页占位符编号。旧 SQL 在 filter=all 时只提供 3 个值却引用
+/// `OFFSET $4`，sqlx-sqlite 把缺失的 $4 按 NULL 绑定，SQLite 对 `LIMIT/OFFSET NULL`
+/// 报 SQLITE_MISMATCH(20) "datatype mismatch" → 线上 500；filter=due 则是
+/// $3/$4 值互换（due 阈值拿到 offset、OFFSET 拿到 now）静默返回错误结果。
+#[actix_web::test]
+async fn flashcards_list_filter_all_and_pagination() {
+    let app = spawn_app().await;
+    let dict_id = seed_dictionary(
+        &app.state,
+        "闪卡分页词典",
+        "en",
+        "en",
+        &[
+            ("apple", "n. 苹果"),
+            ("apply", "v. 申请"),
+            ("banana", "n. 香蕉"),
+        ],
+    )
+    .await;
+    let mut svc = init_service(&app.state).await;
+    let _: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/auth/register")
+            .set_json(serde_json::json!({"username": "pager", "password": "password123"}))
+            .to_request(),
+    )
+    .await;
+    let login: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri("/api/auth/login")
+            .set_json(serde_json::json!({"username": "pager", "password": "password123"}))
+            .to_request(),
+    )
+    .await;
+    let token = login["access_token"].as_str().unwrap().to_string();
+    for word in ["apple", "apply", "banana"] {
+        let _: Value = actix_test::call_and_read_body_json(
+            &mut svc,
+            TestRequest::post()
+                .uri("/api/flashcards")
+                .pipe_bearer(&token)
+                .set_json(serde_json::json!({"word": word, "dictionary_id": dict_id}))
+                .to_request(),
+        )
+        .await;
+    }
+
+    // 线上复现路径：filter=all + 大 page_size（曾 500 datatype mismatch）
+    let resp = actix_test::call_service(
+        &mut svc,
+        TestRequest::get()
+            .uri("/api/flashcards?filter=all&page=1&page_size=500")
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200, "filter=all 不应再 500");
+    let all: Value = actix_test::read_body_json(resp).await;
+    let items = all["items"].as_array().expect("items 数组");
+    assert_eq!(items.len(), 3, "filter=all 应返回全部 3 张卡：{all:?}");
+
+    // 分页：filter=all page=2/page_size=2 → 第 3 张（OFFSET 绑定正确）
+    let page2: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri("/api/flashcards?filter=all&page=2&page_size=2")
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    let items2 = page2["items"].as_array().expect("items 数组");
+    assert_eq!(items2.len(), 1, "第二页应只剩 1 张：{page2:?}");
+
+    // filter=due 翻页不再拿 now 当 OFFSET（旧代码恒空）
+    let due2: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri("/api/flashcards?filter=due&page=2&page_size=2")
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        due2["items"].as_array().expect("items 数组").len(),
+        1,
+        "due 过滤翻页应返回第 3 张新卡：{due2:?}"
+    );
+
+    // 复习第一张（Good → 数天后才到期）：due 应排除它，all 仍含它（$4=now 阈值绑定正确）
+    let first_id = items[0]["vocab_item_id"].as_i64().unwrap() as i32;
+    let _: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::post()
+            .uri(&format!("/api/flashcards/{first_id}/review"))
+            .pipe_bearer(&token)
+            .set_json(serde_json::json!({"rating": 3}))
+            .to_request(),
+    )
+    .await;
+    let due: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri("/api/flashcards?filter=due&page=1&page_size=500")
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(due["items"].as_array().unwrap().len(), 2, "复习后的卡不应在 due 列表：{due:?}");
+    let all: Value = actix_test::call_and_read_body_json(
+        &mut svc,
+        TestRequest::get()
+            .uri("/api/flashcards?filter=all&page=1&page_size=500")
+            .pipe_bearer(&token)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(all["items"].as_array().unwrap().len(), 3, "all 列表仍应含复习过的卡：{all:?}");
+}
+
 // ── 吸收自 PythonMDict 的学习/兼容功能 ──────────────────────────
 
 #[actix_web::test]

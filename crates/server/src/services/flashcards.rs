@@ -379,8 +379,12 @@ pub async fn list_cards(
 ) -> Result<Value, AppError> {
     let backend = state.db.get_database_backend();
     let now = datetime_to_ts(Utc::now());
+    // 占位符编号必须与 values 下标一一对应（sqlx-sqlite 把 $N 映射到第 N 个值；
+    // 编号超出 values 长度时 sqlx 不报错而是按 NULL 绑定，NULL 进 LIMIT/OFFSET
+    // 会被 SQLite 以 SQLITE_MISMATCH(code 20) "datatype mismatch" 拒绝）。
+    // 这里 $1=user_id、$2=LIMIT、$3=OFFSET、$4=due 阈值（仅 due 过滤）。
     let (cond, params) = match filter {
-        "due" => ("AND f.due <= $3", vec![now.into()]),
+        "due" => ("AND f.due <= $4", vec![now.into()]),
         _ => ("", Vec::new()),
     };
     let mut values = vec![user_id.into(), page_size.into(), ((page - 1).max(0) * page_size).into()];
@@ -395,7 +399,7 @@ pub async fn list_cards(
                  JOIN vocab_items v ON v.id = f.vocab_item_id \
                  LEFT JOIN dictionaries d ON d.id = v.dictionary_id \
                  WHERE v.user_id = $1 {cond} \
-                 ORDER BY f.due, f.vocab_item_id LIMIT $2 OFFSET $4"
+                 ORDER BY f.due, f.vocab_item_id LIMIT $2 OFFSET $3"
             ),
             values,
         ))
