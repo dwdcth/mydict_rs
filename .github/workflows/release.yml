@@ -111,6 +111,10 @@ jobs:
         run: |
           make fetch-ort ORT_TARGET=${{ matrix.target }}
           echo "ORT_LIB_LOCATION=$GITHUB_WORKSPACE/.cache/onnxruntime-123" >> "$GITHUB_ENV"
+          # ort-sys 的构建脚本没声明 rerun-if-env-changed，rust-cache 恢复的
+          # 旧输出会让 cargo 跳过重跑、继续链 CDN 下载版（实测 aarch64 踩坑）；
+          # 清掉它的构建产物强制按 ORT_LIB_LOCATION 重新探测链接
+          cargo clean -p ort-sys || true
 
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }} -p server
