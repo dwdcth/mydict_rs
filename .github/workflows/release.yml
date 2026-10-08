@@ -117,6 +117,7 @@ jobs:
           cargo clean -p ort-sys || true
 
       - name: Build (release)
+        shell: bash   # Windows 默认 pwsh 不认 set -o pipefail
         run: |
           set -o pipefail
           cargo build --release --target ${{ matrix.target }} -p server -vv 2>&1 | tee build.log | tail -3
