@@ -190,8 +190,9 @@ pub struct SynthAudio {
 
 pub struct TtsState {
     /// 引擎（含失败闩：Err 为首次初始化的错误信息）。
-    /// std::sync::Mutex：合成在 spawn_blocking 里持锁（tokio::Mutex 的 guard 跨不过边界）
-    engine: tokio::sync::OnceCell<Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, String>>,
+    /// RwLock<Option<..>> 而非 OnceCell：tts_engine 切回 edge 时要能卸载（take）。
+    /// 内层 std::sync::Mutex：合成在 spawn_blocking 里持锁（tokio::Mutex 的 guard 跨不过边界）
+    engine: std::sync::RwLock<Option<Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, String>>>,
     /// 初始化互斥（防并发重复下载）
     init_lock: tokio::sync::Mutex<()>,
     /// 合成串行信号量（CPU 密集，单并发足够且防内存翻倍）
@@ -203,7 +204,7 @@ pub struct TtsState {
 impl TtsState {
     pub fn new() -> Self {
         Self {
-            engine: tokio::sync::OnceCell::new(),
+            engine: std::sync::RwLock::new(None),
             init_lock: tokio::sync::Mutex::new(()),
             permit: tokio::sync::Semaphore::new(1),
             audio: MokaCache::builder()
@@ -215,9 +216,30 @@ impl TtsState {
         }
     }
 
+    /// 当前引擎快照（未初始化/已卸载 = None；Err = 初始化失败闩）
+    fn engine_snapshot(&self) -> Option<Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, String>> {
+        self.engine.read().ok().and_then(|guard| guard.clone())
+    }
+
+    fn set_engine(&self, value: Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, String>) {
+        if let Ok(mut guard) = self.engine.write() {
+            *guard = Some(value);
+        }
+    }
+
     /// 触发 moka 维护任务：真正释放空闲过期音频占的内存（调度器周期调用）
     pub fn run_maintenance(&self) {
         self.audio.run_pending_tasks();
+    }
+
+    /// 卸载 kokoro 引擎（tts_engine 切回 edge 时由设置更新调用）：
+    /// 模型 + onnxruntime 会话内存（数百 MB）随即释放——在途合成持有 Arc
+    /// 克隆，各自结束后自然归零。失败闩一并清除，之后切回 kokoro 可重试初始化。
+    pub fn unload_kokoro(&self) -> bool {
+        match self.engine.write() {
+            Ok(mut guard) => guard.take().is_some(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -542,7 +564,7 @@ pub async fn synthesize_audio(
                 Err(err) => {
                     tracing::warn!(error = %err, voice = %voice, "edge-tts 合成失败，尝试 kokoro 兜底");
                     // 只回落到**已加载**的 kokoro（不偷偷触发 337MB 模型下载）
-                    if let Some(Ok(kokoro)) = state.tts.engine.get().cloned() {
+                    if let Some(Ok(kokoro)) = state.tts.engine_snapshot() {
                         let voice2: &str = if zh { KOKORO_ZH_FALLBACK } else { KOKORO_EN_FALLBACK };
                         let key2 = format!("{AUDIO_REV}|kokoro-fb|{voice2}|{word}");
                         if let Some(hit) = state.tts.audio.get(&key2) {
@@ -602,29 +624,29 @@ async fn init_kokoro(
 ) -> Result<Arc<std::sync::Mutex<kokoro_micro::TtsEngine>>, AppError> {
     let latched = |msg: String| {
         AppError::internal_msg(&format!(
-            "kokoro 引擎不可用（初始化失败已闩住，重启服务后重试）：{msg}"
+            "kokoro 引擎不可用（初始化失败已闩住，切换引擎或重启服务后重试）：{msg}"
         ))
     };
-    if let Some(Ok(engine)) = state.tts.engine.get() {
+    if let Some(Ok(engine)) = state.tts.engine_snapshot() {
         return Ok(engine.clone());
     }
-    if let Some(Err(msg)) = state.tts.engine.get() {
+    if let Some(Err(msg)) = state.tts.engine_snapshot() {
         return Err(latched(msg.clone()));
     }
     let _guard = state.tts.init_lock.lock().await;
-    // 双检：等锁期间别的请求可能已初始化好
-    match state.tts.engine.get() {
+    // 双检：等锁期间别的请求可能已初始化好（或刚好被卸载——以锁内快照为准）
+    match state.tts.engine_snapshot() {
         Some(Ok(engine)) => Ok(engine.clone()),
         Some(Err(msg)) => Err(latched(msg.clone())),
         None => match kokoro_micro::TtsEngine::new().await {
             Ok(engine) => {
                 let arc = Arc::new(std::sync::Mutex::new(engine));
-                let _ = state.tts.engine.set(Ok(arc.clone()));
+                state.tts.set_engine(Ok(arc.clone()));
                 Ok(arc)
             }
             Err(err) => {
                 let msg = format!("模型加载失败（首次使用需联网下载 ~337MB 到 ~/.cache/k/）：{err}");
-                let _ = state.tts.engine.set(Err(msg.clone()));
+                state.tts.set_engine(Err(msg.clone()));
                 Err(AppError::internal_msg(&msg))
             }
         },

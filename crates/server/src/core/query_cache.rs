@@ -27,8 +27,8 @@ pub struct QueryCache {
 }
 
 /// JSON 值的内存粗估：每节点 16B 开销 + 字符串按字节 + String 头 24B。
-/// 只用于缓存计重，量级对即可。
-fn json_weight(value: &Value) -> u64 {
+/// 只用于缓存计重，量级对即可。（pub(crate) 供在线词典缓存复用）
+pub(crate) fn json_weight(value: &Value) -> u64 {
     fn walk(value: &Value, acc: &mut u64) {
         match value {
             Value::String(s) => *acc += 24 + s.len() as u64 + 16,

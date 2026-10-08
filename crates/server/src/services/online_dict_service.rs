@@ -28,10 +28,14 @@ pub const SOURCE_IDS: &[&str] = &[
 static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
-/// 在线结果缓存（10 分钟 / 2000 条）：这些站点对高频抓取不友好
+/// 在线结果缓存（10 分钟 / 32MB 按体积计重）：这些站点对高频抓取不友好；
+/// 词条 JSON 大小悬殊（维基长文几百 KB），按条数限会失守
 static CACHE: LazyLock<MokaCache<String, Arc<Value>>> = LazyLock::new(|| {
     MokaCache::builder()
-        .max_capacity(2000)
+        .max_capacity(32 * 1024 * 1024)
+        .weigher(|_k, v: &Arc<Value>| {
+            crate::core::query_cache::json_weight(v).min(u32::MAX as u64) as u32
+        })
         .time_to_live(Duration::from_secs(600))
         .build()
 });

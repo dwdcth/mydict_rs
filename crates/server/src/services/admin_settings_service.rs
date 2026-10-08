@@ -267,6 +267,13 @@ pub async fn update_settings(
             crate::services::random_entry::warm_bounds_in_background(&state2).await;
         });
     }
+    // tts_engine 切回 edge：卸载 kokoro 模型（数百 MB 常驻——onnxruntime 会话
+    // + 权重），只留 edge 在线合成。之后切回 kokoro 按需重新初始化。
+    if fields_present.iter().any(|k| k == "tts_engine")
+        && updates.get("tts_engine").and_then(|v| v.as_str()) != Some("kokoro")
+    {
+        state.tts.unload_kokoro();
+    }
     get_all_settings(&state.db, defaults)
         .await
         .map_err(AppError::from)

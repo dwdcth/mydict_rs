@@ -22,7 +22,9 @@ use crate::core::config::Settings;
 pub async fn connect(settings: &Settings) -> Result<DatabaseConnection, sea_orm::DbErr> {
     let url = settings.database_url();
     let mut opts = ConnectOptions::new(&url);
-    opts.max_connections(8).min_connections(1).sqlx_logging(false);
+    // SQLite 单写者：大写任务经 bulk_write 互斥排队，查询本身毫秒级——
+    // 4 个连接足够（每连接还有 ~2MB 页缓存常驻，池越大 RSS 越高）
+    opts.max_connections(4).min_connections(1).sqlx_logging(false);
     if settings.is_sqlite() {
         opts.map_sqlx_sqlite_opts(sqlite_options);
     }
